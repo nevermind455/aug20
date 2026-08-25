@@ -5,3 +5,12 @@ Aug 25 14:00:52 ET,phase2-book,UP,2.5,DOWN,UP,,rejected_or_unsubmitted
 Aug 25 14:00:53 ET,phase2,DOWN,2.5,DOWN,UP,,rejected_or_unsubmitted
 Aug 25 14:01:06 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
 Aug 25 14:01:18 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:04:11 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:04:25 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:04:39 ET,phase2-book,UP,2.5,DOWN,UP,,rejected_or_unsubmitted
+Aug 25 14:04:39 ET,phase2,DOWN,2.5,DOWN,UP,,rejected_or_unsubmitted
+Aug 25 14:04:52 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:05:05 ET,phase2,DOWN,2.5,DOWN,DOWN,DOWN,rejected_or_unsubmitted
+Aug 25 14:07:10 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:11:06 ET,phase2-book,UP,2.5,DOWN,UP,,rejected_or_unsubmitted
+Aug 25 14:11:07 ET,phase2,DOWN,2.5,DOWN,UP,,rejected_or_unsubmitted

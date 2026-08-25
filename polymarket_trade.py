@@ -367,6 +367,29 @@ def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
     }
 
 
+def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
+    """Raise a dollar stake just enough to buy the venue's minimum shares.
+
+    Mirrors paper_trade.size_to_venue_minimum. Returns the stake unchanged
+    whenever it cannot verify a raise is needed - a missing book, an unusable
+    best ask, or one above the price cap - so an unreadable market can never
+    silently enlarge a live order.
+    """
+    try:
+        wanted = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        minimum = Decimal(str(rules["minimum"]))
+        if minimum <= 0 or not asks:
+            return float(wanted)
+        best = Decimal(str(asks[0]["price"]))
+        ceiling = Decimal(str(cap))
+        if best <= 0 or best > ceiling:
+            return float(wanted)
+        required = (minimum * best).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        return float(wanted if wanted >= required else required)
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return float(amount)
+
+
 def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
     if not isinstance(info, dict):
         raise RuntimeError("CLOB market-info response is not an object")
@@ -649,12 +672,21 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         _bids, asks = orderbook.validate_buy_liquidity(
             token_id, amount, float(limit), config.MAX_ALLOWED_SPREAD,
             min_price=float(floor))
+        # Raise the stake just enough to buy the venue's minimum shares, the
+        # same way PAPER's size_to_venue_minimum does. Without this, a fixed
+        # BET_SIZE can only fill at asks <= BET_SIZE / minimum - $2.50 stops
+        # filling above 0.50 - so live refused most of the prices paper had
+        # been filling, and the two modes measured different strategies.
+        # The order costs more than BET_SIZE at those prices; that is already
+        # true in paper and is what the startup sizing NOTE describes.
+        amount = _size_to_venue_minimum(amount, asks, rules, limit)
         shares, estimated_fee = _quote_fok(
             asks, Decimal(str(amount)), limit,
             rules["fee_rate"], rules["fee_exponent"])
         if shares < rules["minimum"]:
             raise RuntimeError(
-                f"executable size {shares:.6f} is below venue minimum {rules['minimum']}")
+                f"executable size {shares:.6f} is below venue minimum "
+                f"{rules['minimum']} even after sizing up to ${amount:.2f}")
         funds = _read_balance(client)
         if funds is None:
             raise RuntimeError("malformed balance/allowance response")
