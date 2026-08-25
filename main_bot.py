@@ -1005,7 +1005,12 @@ async def run_bot():
                 # allowed only where the pair-lock proves the finished pair
                 # cannot lose. Unconditional pairs were measured at -$0.22 each
                 # at the 1.0100 overround this book actually runs.
-                multi_allowed = config.PHASE2_MULTI_SIGNAL and lock_ok
+                # With the lock ON, a complement is allowed only where the pair
+                # is provably profitable. With it OFF the operator has chosen to
+                # take pairs unconditionally, so the guard stands down entirely
+                # - "lock disabled" must mean no restriction, not no pairs.
+                multi_allowed = config.PHASE2_MULTI_SIGNAL and (
+                    lock_ok or not config.PAIR_LOCK_ENABLED)
                 if not (flip_allowed or lock_ok or multi_allowed):
                     print(
                         f"{_ts()} [RISK] No order: already hold the other leg of "
@@ -1045,7 +1050,7 @@ async def run_bot():
                     # the $1.00 the pair redeems for. Same rule in PAPER and
                     # LIVE so the paper run rehearses what live will do.
                     held_side_token = up_id if side == "UP" else down_id
-                    if held_side_token in held_tokens:
+                    if config.PAIR_LOCK_ENABLED and held_side_token in held_tokens:
                         pair_ok, pair_detail = _pair_lock_permit(
                             tokens["condition_id"], held_side_token,
                             config.MAX_BUY_PRICE)
