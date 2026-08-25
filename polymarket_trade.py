@@ -35,6 +35,10 @@ last_order_status = None
 last_order_receipt = None
 PUSD_BASE_UNITS = Decimal("1000000")
 CONDITION_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+# Diagnostics that must survive stdout buffering.
+_DIAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "live_diagnostics.log")
+
 HEX_SECRET_RE = re.compile(r"0x[0-9a-fA-F]{64}")
 FEE_PRECISION = Decimal("0.00001")
 
@@ -809,6 +813,20 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                     shape = (f"status={str(resp.get('status') or 'missing')!r} "
                              f"fields={present}")
                 print(f"[LIVE] unclassified response shape: {shape}")
+                # Also write it to disk. stdout is block-buffered when it is
+                # not a console, so the one line that identifies this failure
+                # can sit unseen in a buffer for the whole run.
+                try:
+                    import datetime as _dt
+                    with open(_DIAG_PATH, "a", encoding="utf-8") as _fh:
+                        _fh.write(
+                            f"[{_dt.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                            f"unclassified response: {shape}\n"
+                            f"    err={err}\n")
+                        _fh.flush()
+                        os.fsync(_fh.fileno())
+                except Exception:
+                    pass
                 err = f"ambiguous order response; round blocked: {err}"
             last_order_error = err
             print(f"[LIVE] Place order error: {last_order_error}")

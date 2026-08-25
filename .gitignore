@@ -60,3 +60,6 @@ wallet_positions.json
 # Editor/tooling backups.
 *.bak
 *.bak[0-9]
+
+# Live diagnostics - may name venue fields; keep local.
+live_diagnostics.log
