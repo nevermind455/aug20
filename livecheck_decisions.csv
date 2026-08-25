@@ -1,0 +1,7 @@
+time_et,phase,side,amount,price_side,book_side,chainlink_side,result
+Aug 25 14:00:24 ET,phase2,DOWN,2.5,DOWN,DOWN,,rejected_or_unsubmitted
+Aug 25 14:00:38 ET,phase2,DOWN,2.5,DOWN,DOWN,,rejected_or_unsubmitted
+Aug 25 14:00:52 ET,phase2-book,UP,2.5,DOWN,UP,,rejected_or_unsubmitted
+Aug 25 14:00:53 ET,phase2,DOWN,2.5,DOWN,UP,,rejected_or_unsubmitted
+Aug 25 14:01:06 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
+Aug 25 14:01:18 ET,phase2,UP,2.5,UP,UP,,rejected_or_unsubmitted
