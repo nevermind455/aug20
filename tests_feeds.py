@@ -1518,7 +1518,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "1382621bd76a90a86d906a9d72b884374176cc4fd12cdfc970999f5b538662ef",
+    "config.py": "9e5f506a7b9fecfa0855cb82ba1b82b9e2a3dd3e4f8880805fd5170dec0d7365",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -1527,12 +1527,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-25: PAPER may acquire the complementary outcome only
     # after a fresh, round-local SIG PRICE epoch; LIVE and ambiguous restarts
     # remain blocked, and executor commit still rechecks the selected side.
-    "main_bot.py": "5b859953c68a022771dd7396b1a84250cffce95a8e1164ea713c4873d3bb355c",
+    "main_bot.py": "0ea75a4abe4862585edc7e145f9619fc9197311ebc5935a60d00403eb4b4fa06",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
     "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
-    "polymarket_trade.py": "60ecbddbf0864c1afe748bbb80702df966ec81e2e09a5ad5fbdf5a4410935c89",
+    "polymarket_trade.py": "cbfb882012d8f55edc9c7445c0b28a269329df612e894c91539a3d26a602b531",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
     "timer.py": "55cdaf1655b210c83791730b094e79d5c0b00a7e79b6a6ca2bd2950df21e3124",

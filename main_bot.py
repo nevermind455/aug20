@@ -442,6 +442,7 @@ def _kill_switch():
 
 async def run_bot():
     start_price = None
+    joined_window = None
     boundary_backfilled = False
     start_chainlink_price = None
     active_window = None
@@ -531,6 +532,12 @@ async def run_bot():
         round_end = round_window + 300
         exact_remaining = round_end - sampled_wall
         if round_window != active_window:
+            # The first window this process sees was already underway when it
+            # started: its open is behind us, the book has moved, and only part
+            # of the trading window remains. Note it so the round can be
+            # observed but not traded, and begin at the next clean boundary.
+            if joined_window is None:
+                joined_window = round_window
             # Never carry a prior round's strike into the next market.  The
             # old loop only overwrote these when a feed read succeeded.
             active_window = round_window
@@ -816,6 +823,17 @@ async def run_bot():
                 "price_side": submit_price_side, "book_side": "", "chainlink_side": "",
                 "result": result,
             })
+            await asyncio.sleep(0.2)
+            continue
+
+        if (config.SKIP_JOINED_ROUND and joined_window is not None
+                and active_window == joined_window):
+            if skip_logged_window != active_window:
+                skip_logged_window = active_window
+                nxt = now_et(round_end).strftime("%I:%M%p ET").lstrip("0")
+                print(f"{_ts()} [ROUND] Joined this round in progress "
+                      f"({exact_remaining:.0f}s left); waiting for the next "
+                      f"market at {nxt}.")
             await asyncio.sleep(0.2)
             continue
 

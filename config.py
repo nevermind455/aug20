@@ -240,6 +240,12 @@ BOUNDARY_BACKFILL_AFTER = _env_float("BOUNDARY_BACKFILL_AFTER", "15")
 if not math.isfinite(BOUNDARY_BACKFILL_AFTER) or not 5 <= BOUNDARY_BACKFILL_AFTER <= 120:
     raise ValueError("BOUNDARY_BACKFILL_AFTER must be between 5 and 120 seconds")
 
+# A round already underway when the bot starts is a degraded round: its
+# opening print may only be recoverable from REST, the book has moved, and
+# part of its trading window is already gone. With this on the bot observes
+# that round without trading it and begins at the next clean boundary.
+SKIP_JOINED_ROUND = bool(_env_bool("SKIP_JOINED_ROUND", False))
+
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))

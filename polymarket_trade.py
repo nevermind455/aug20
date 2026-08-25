@@ -796,6 +796,19 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             # may describe an accepted order incompletely. Block the round.
             if not _is_no_match(err) and not _definitive_rejection(resp):
                 _mark_ambiguous(condition_id, end)
+                # Say WHAT came back, not just that it was unclassifiable.
+                # A venue with a taker matching delay can acknowledge an order
+                # before it has any trade evidence, and the parser requires
+                # tradeIDs or transactionsHashes - so a perfectly ordinary
+                # accepted order reads as ambiguous and blocks the round.
+                # Field names and status only; no amounts, ids or wallet data.
+                shape = "non-dict"
+                if isinstance(resp, dict):
+                    present = sorted(k for k, v in resp.items()
+                                     if v not in (None, "", [], {}))
+                    shape = (f"status={str(resp.get('status') or 'missing')!r} "
+                             f"fields={present}")
+                print(f"[LIVE] unclassified response shape: {shape}")
                 err = f"ambiguous order response; round blocked: {err}"
             last_order_error = err
             print(f"[LIVE] Place order error: {last_order_error}")
