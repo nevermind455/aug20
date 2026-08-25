@@ -529,6 +529,16 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             lambda window, _condition: ledger.authorized_cost_for_window(window))
         main_bot._round_held_tokens_provider = (
             lambda window, _condition: ledger.authorized_tokens_for_window(window))
+        # PHASE2_MULTI_SIGNAL runs in LIVE too, and there a complement leg is
+        # only permitted where the pair-lock proves the finished pair cannot
+        # lose - so the lock needs a real cost basis here, not just in PAPER.
+        # open_leg_basis reads confirmed positions, which LIVE populates from
+        # the private fill stream via ingest_fill_store -> record_fill_durable.
+        # Unfilled authorizations are deliberately not a basis: reserving an
+        # order is not owning a leg, and pricing a pair off one would complete
+        # a pair whose first half never existed.
+        main_bot._round_leg_basis_provider = (
+            lambda condition, token: ledger.open_leg_basis(condition, token))
         main_bot._execution_ready_provider = hub.user.ready_for_market
 
     # Prove the accounting directory is writable before any feed or order task

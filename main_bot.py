@@ -1000,8 +1000,12 @@ async def run_bot():
                         lock_detail = "no ask on the selected leg"
                 # Multi-signal rounds are expected to hold both legs, so the
                 # guard cannot also be the thing that stops the next cycle
-                # trading. PAPER only, matching the leg placement below.
-                multi_allowed = config.PHASE2_MULTI_SIGNAL and mode == "PAPER"
+                # trading. It now runs in LIVE too, so standing the guard down
+                # unconditionally is no longer acceptable: the complement is
+                # allowed only where the pair-lock proves the finished pair
+                # cannot lose. Unconditional pairs were measured at -$0.22 each
+                # at the 1.0100 overround this book actually runs.
+                multi_allowed = config.PHASE2_MULTI_SIGNAL and lock_ok
                 if not (flip_allowed or lock_ok or multi_allowed):
                     print(
                         f"{_ts()} [RISK] No order: already hold the other leg of "
@@ -1023,7 +1027,7 @@ async def run_bot():
             # orders are not an atomic pair and LIVE must never hold both legs
             # by accident. The exposure cap is still enforced per leg.
             extras_started = time.monotonic()
-            if config.PHASE2_MULTI_SIGNAL and mode == "PAPER":
+            if config.PHASE2_MULTI_SIGNAL:
                 for source, extra_side in (("book", final_book_side),
                                            ("chainlink", final_chainlink_side)):
                     if extra_side not in ("UP", "DOWN") or extra_side == side:
@@ -1035,6 +1039,30 @@ async def run_bot():
                               f"${config.MAX_ROUND_EXPOSURE:.2f}).")
                         continue
                     extra_token = up_id if extra_side == "UP" else down_id
+                    # This leg disagrees with the order side, so if that side is
+                    # held it is the complement - and completing a pair is only
+                    # worth doing when both entries plus both fees stay under
+                    # the $1.00 the pair redeems for. Same rule in PAPER and
+                    # LIVE so the paper run rehearses what live will do.
+                    held_side_token = up_id if side == "UP" else down_id
+                    if held_side_token in held_tokens:
+                        pair_ok, pair_detail = _pair_lock_permit(
+                            tokens["condition_id"], held_side_token,
+                            config.MAX_BUY_PRICE)
+                        if not pair_ok:
+                            print(f"{_ts()} [MULTI] {source} leg skipped: would "
+                                  f"complete a losing pair; {pair_detail}")
+                            _append_trade({
+                                "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
+                                "phase": f"phase2-{source}",
+                                "side": extra_side,
+                                "amount": config.BET_SIZE,
+                                "price_side": final_price_side or "",
+                                "book_side": final_book_side or "",
+                                "chainlink_side": final_chainlink_side or "",
+                                "result": "skipped_pair_would_lose",
+                            })
+                            continue
                     # SIG CHAINLINK reads from memory, so it can re-check inside
                     # the broker's pre-submit guard exactly like SIG PRICE does.
                     # SIG BOOK cannot: that guard runs while the broker holds
