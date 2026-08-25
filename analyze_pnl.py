@@ -145,13 +145,26 @@ def edge_test(fills: list[dict]) -> None:
     if not done:
         return
     rule("EDGE TEST  (the number that decides whether tuning can help)")
-    paid = statistics.mean(f["price"] for f in done)
-    won = sum(1 for f in done if f["won"]) / len(done)
+    # Weight both sides by SHARES. The payout is $1.00 per share, so shares are
+    # the unit both numbers have to be measured in for the comparison to mean
+    # anything. Taking a plain mean over fills counted a 5-share fill at 0.90
+    # and a 10-share fill at 0.20 equally, and counted a position built from
+    # ten fills ten times - which on a both-legged round, where one leg always
+    # wins and one always loses, manufactured an edge out of fill counts. It
+    # read +8.4 points on data whose share-weighted edge was negative.
+    total_shares = sum(f["shares"] for f in done)
+    if total_shares <= 0:
+        return
+    paid = sum(f["shares"] * f["price"] for f in done) / total_shares
+    won = sum(f["shares"] for f in done if f["won"]) / total_shares
     turnover = sum(f["cost"] for f in done)
     fees = sum(f["fee"] for f in done)
+    positions = len({(f["token"], f["settled"]) for f in done})
     print(f"  average price paid        {paid * 100:>6.1f}%   <- the market's implied odds")
     print(f"  actual win rate           {won * 100:>6.1f}%   <- what really happened")
     print(f"  edge                      {(won - paid) * 100:>+6.1f} points")
+    print(f"  (share-weighted over {total_shares:,.0f} shares in {positions} positions, "
+          f"{len(done)} fills)")
     print(f"  fee drag                  {-fees / turnover * 100:>+6.2f} points of turnover")
     if won < paid:
         print("\n  Losing below the price paid means the signal is worse than the")
