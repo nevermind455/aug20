@@ -212,6 +212,23 @@ if not 0.5 <= ROUND_POLL_SECONDS <= 30.0:
 # missing BINANCE inputs cancel the round; Chainlink abstains like SIG BOOK
 # already does on a one-sided book. Off by default so the stricter original
 # contract is what you get unless the looser one is chosen deliberately.
+# Polymarket enables a taker matching delay on these markets (`itode: true` on
+# /clob-markets) but the endpoint states only THAT a delay exists, never how
+# long. An order submitted without knowing it can match after the round has
+# already resolved, so the live path refuses outright by default.
+#
+# Set this to the delay you are willing to assume, in seconds, and live orders
+# are permitted outside that many seconds from the round end - refused inside
+# it, where an unknown delay could span resolution. 0 keeps the hard refusal.
+#
+# Choose generously: if the real delay exceeds this, orders sent just outside
+# the window can still match after expiry, which is exactly the failure the
+# refusal exists to prevent. It costs only the tail of a 300s round.
+ASSUMED_MATCH_DELAY_SECONDS = _env_float("ASSUMED_MATCH_DELAY_SECONDS", "0")
+if (not math.isfinite(ASSUMED_MATCH_DELAY_SECONDS)
+        or not 0 <= ASSUMED_MATCH_DELAY_SECONDS <= 120):
+    raise ValueError("ASSUMED_MATCH_DELAY_SECONDS must be between 0 and 120")
+
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))

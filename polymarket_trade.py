@@ -421,9 +421,12 @@ def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
     taker_delay = info.get("itode", False)
     if not isinstance(neg_risk, bool) or not isinstance(taker_delay, bool):
         raise RuntimeError("CLOB market has invalid boolean execution rules")
-    if taker_delay:
+    if taker_delay and config.ASSUMED_MATCH_DELAY_SECONDS <= 0:
         # This endpoint exposes only that a delay is enabled, not its duration.
         # Submitting near a hard expiry cutoff without the duration would guess.
+        # Set ASSUMED_MATCH_DELAY_SECONDS to trade anyway, outside a window of
+        # that many seconds from the round end; the caller enforces it, because
+        # only the caller knows how much of the round is left.
         raise RuntimeError("CLOB market has an undisclosed matching delay")
     fee_params = (float(fee_rate), fee_exponent)
     with _state_lock:
@@ -432,6 +435,7 @@ def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
         while len(_market_fee_by_token) > _MAX_FEE_CACHE_TOKENS:
             _market_fee_by_token.pop(next(iter(_market_fee_by_token)))
     return {
+        "taker_delay": bool(taker_delay),
         "minimum": minimum,
         "tick": tick,
         "neg_risk": neg_risk,
@@ -616,6 +620,19 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         rules = _validate_market_mapping(
             client.get_clob_market_info(str(condition_id)), condition_id,
             up_token_id, down_token_id)
+        if rules.get("taker_delay"):
+            # The venue will not state the delay, so treat it as at most the
+            # assumed value and refuse inside that window - an order sent later
+            # than this could match after the round has already resolved, which
+            # is the whole reason the flag is dangerous. Guessing LOW is the
+            # unsafe direction: if the real delay exceeds the assumption, an
+            # order accepted just outside the window still lands too late.
+            assumed = float(config.ASSUMED_MATCH_DELAY_SECONDS)
+            remaining = end - time.time()
+            if remaining <= assumed:
+                raise RuntimeError(
+                    f"undisclosed matching delay: {remaining:.1f}s left is "
+                    f"inside the assumed {assumed:.1f}s delay window")
         if config.TICK_SIZE is not None and Decimal(str(config.TICK_SIZE)) != rules["tick"]:
             raise RuntimeError("configured TICK_SIZE disagrees with the current market")
         if config.NEG_RISK is not None and bool(config.NEG_RISK) != rules["neg_risk"]:

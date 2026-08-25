@@ -690,7 +690,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "eed930a1b1b2efc414ff47e3f94579e3c7bc33e01af9c8a06345b599b823820c",
+    "config.py": "c54b4b6f8f036f42788678456baf8b33bf00e74b51a508332e411918d173e204",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -704,7 +704,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config is not explicitly BTC / 5m / enabled 60-second TWAP.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
     "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
-    "polymarket_trade.py": "c48265480c7a3bbd5c30acd23f729203900b1b1565ae0cdfd3ae4983c4d74c97",
+    "polymarket_trade.py": "4a25f067f1a6c8990d5838adcb567409600137648ec0e5fa0ee967eee410cba0",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
     "timer.py": "55cdaf1655b210c83791730b094e79d5c0b00a7e79b6a6ca2bd2950df21e3124",
