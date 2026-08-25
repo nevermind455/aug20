@@ -1,6 +1,8 @@
 """Polymarket CLOB V2 live execution with strict FOK acknowledgement rules."""
 import math
 import os
+import pathlib
+import sys
 import re
 import threading
 import time
@@ -817,6 +819,13 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 # not a console, so the one line that identifies this failure
                 # can sit unseen in a buffer for the whole run.
                 try:
+                    # The suites drive place_trade with stubbed clients and
+                    # deliberately malformed replies. Writing those to the same
+                    # file makes test fixtures indistinguishable from venue
+                    # behaviour - which already sent one investigation down a
+                    # false trail. Record only from a real run.
+                    if pathlib.Path(sys.argv[0]).name.startswith("tests_"):
+                        raise RuntimeError("test run")
                     import datetime as _dt
                     with open(_DIAG_PATH, "a", encoding="utf-8") as _fh:
                         _fh.write(
