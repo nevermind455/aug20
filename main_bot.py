@@ -475,7 +475,12 @@ async def run_bot():
         f"{_ts()} [BOT] Time check: now {now_et().strftime('%b %d %H:%M:%S ET')} | "
         f"current round {current_round_window_et()} (compare with Polymarket)"
     )
-    for s, e, lo, hi, need_lo, need_hi in getattr(config, "PHASE1_STAKE_NOTES", ()):
+    # Phase-1 band sizing notes describe orders phase 1 would place. Printing
+    # them while phase 1 is off says the bot will do something it will not,
+    # and sends anyone reading the log looking at the wrong price range.
+    for s, e, lo, hi, need_lo, need_hi in (
+            getattr(config, "PHASE1_STAKE_NOTES", ())
+            if config.PHASE1_ENABLED else ()):
         print(
             f"{_ts()} [BOT] NOTE: band {lo:.2f}-{hi:.2f} (T-{s}..T-{e}) exceeds "
             f"BET_SIZE/5, so the venue's 5-share minimum will size those orders "

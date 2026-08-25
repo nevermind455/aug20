@@ -1527,7 +1527,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-25: PAPER may acquire the complementary outcome only
     # after a fresh, round-local SIG PRICE epoch; LIVE and ambiguous restarts
     # remain blocked, and executor commit still rechecks the selected side.
-    "main_bot.py": "0ea75a4abe4862585edc7e145f9619fc9197311ebc5935a60d00403eb4b4fa06",
+    "main_bot.py": "08dbbec08c0d024e5a955de6167884bb8834bd9cbe0e52faf132c32c43869272",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",

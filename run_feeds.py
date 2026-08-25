@@ -76,6 +76,18 @@ class _ProcessLock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._file = None
+        # Imported here, not in release(). release() runs on the shutdown path,
+        # where a fresh import raises "sys.meta_path is None, Python is likely
+        # shutting down" and prints a traceback over an otherwise clean exit.
+        # The OS lock is freed by closing the handle regardless, so this only
+        # ever cost noise - but the noise looked like a failed release.
+        self._locker = None
+        if os.name == "posix":
+            import fcntl
+            self._locker = fcntl
+        elif os.name == "nt":
+            import msvcrt
+            self._locker = msvcrt
 
     def acquire(self) -> None:
         if self._file is not None:
@@ -88,10 +100,10 @@ class _ProcessLock:
         handle = os.fdopen(fd, "a+", encoding="utf-8")
         try:
             if os.name == "posix":
-                import fcntl
+                fcntl = self._locker
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             elif os.name == "nt":
-                import msvcrt
+                msvcrt = self._locker
                 # msvcrt locks bytes from the current position, so seek to the
                 # sentinel byte first. Append mode ignores this position for
                 # writes, so the journal below is still appended, not truncated.
@@ -123,13 +135,16 @@ class _ProcessLock:
         if self._file is None:
             return
         try:
-            if os.name == "posix":
-                import fcntl
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            elif os.name == "nt":
-                import msvcrt
+            if os.name == "posix" and self._locker is not None:
+                self._locker.flock(self._file.fileno(), self._locker.LOCK_UN)
+            elif os.name == "nt" and self._locker is not None:
                 self._file.seek(self._NT_LOCK_OFFSET)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                self._locker.locking(self._file.fileno(),
+                                     self._locker.LK_UNLCK, 1)
+        except Exception:
+            # Closing the handle below releases the OS lock anyway; a noisy
+            # traceback during interpreter teardown helps nobody.
+            pass
         finally:
             self._file.close()
             self._file = None
