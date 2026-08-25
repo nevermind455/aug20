@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import pathlib
 import statistics
 import sys
@@ -26,9 +27,37 @@ from collections import defaultdict
 from datetime import datetime
 
 ROOT = pathlib.Path(__file__).parent
-LEDGER = ROOT / "paper_ledger.json"
-ORDERS = ROOT / "paper_orders.jsonl"
-TRADES = ROOT / "paper_trade_log.csv"
+
+# This tool does not import config, so nothing else loads .env for it. Without
+# this the env lookups below silently see nothing and fall back to the default
+# names - which is how a redirected profile reported "no ledger" while its real
+# one sat in the same directory. override=False keeps a real environment
+# variable authoritative over the file, matching config.py.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env", override=False, encoding="utf-8")
+except Exception:
+    pass
+
+
+def _state_path(env_name: str, default_name: str) -> pathlib.Path:
+    """Resolve a paper artifact the same way run_feeds.py does.
+
+    These were hardcoded, so a run that redirected its ledger through
+    PAPER_LEDGER_PATH could not be analysed at all - the report simply said
+    "no ledger at .../paper_ledger.json" while the real one sat beside it
+    under a different name. Reading the same environment variables as the bot
+    keeps the report pointed at whatever profile actually ran.
+    """
+    raw = os.environ.get(env_name) or default_name
+    candidate = pathlib.Path(raw)
+    return candidate if candidate.is_absolute() else ROOT / candidate
+
+
+LEDGER = _state_path("PAPER_LEDGER_PATH", "paper_ledger.json")
+ACCOUNT = _state_path("PAPER_ACCOUNT_PATH", "paper_account.json")
+ORDERS = _state_path("PAPER_AUDIT_PATH", "paper_orders.jsonl")
+TRADES = _state_path("PAPER_TRADE_LOG_PATH", "paper_trade_log.csv")
 
 
 def parse_since(raw: str | None) -> float:
@@ -80,7 +109,7 @@ def account(fills: list[dict], led: dict, since: float) -> None:
     rule("ACCOUNT")
     positions = list(led["positions"].values())
     if not since:
-        start = json.loads((ROOT / "paper_account.json").read_text(encoding="utf-8"))
+        start = json.loads(ACCOUNT.read_text(encoding="utf-8"))
         start = start["starting_balance"]
         cost_all = sum(p["cost"] for p in positions)
         payouts = sum((p.get("payout_per_share") or 0.0) * p["shares"]
