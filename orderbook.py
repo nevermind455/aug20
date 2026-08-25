@@ -1,0 +1,182 @@
+"""Validated public CLOB order-book reads used by the decision path."""
+import math
+import time
+from decimal import Decimal, InvalidOperation
+
+import requests
+
+import config
+import http_pool
+import timer
+
+BOOK_URL = "https://clob.polymarket.com/book"
+
+
+def _number(name, value, *, minimum=None, maximum=None, inclusive_min=False):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None:
+        valid = parsed >= minimum if inclusive_min else parsed > minimum
+        if not valid:
+            op = ">=" if inclusive_min else ">"
+            raise ValueError(f"{name} must be {op} {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return parsed
+
+
+def _level(raw, side):
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid {side} level")
+    try:
+        price = Decimal(str(raw.get("price")))
+        size = Decimal(str(raw.get("size")))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {side} level") from exc
+    if not price.is_finite() or not size.is_finite():
+        raise ValueError(f"non-finite {side} level")
+    if not Decimal(0) < price < Decimal(1) or size <= 0:
+        raise ValueError(f"out-of-range {side} level")
+    return price, size
+
+
+def _levels(raw_levels, side):
+    """Aggregate duplicate price rows so malformed depth cannot be double-counted."""
+    aggregated: dict[Decimal, Decimal] = {}
+    for raw in raw_levels or ():
+        price, size = _level(raw, side)
+        aggregated[price] = aggregated.get(price, Decimal(0)) + size
+    reverse = side == "bid"
+    return [
+        {"price": str(price), "size": str(aggregated[price])}
+        for price in sorted(aggregated, reverse=reverse)
+    ]
+
+
+def parse_orderbook(data, token_id, *, max_age_s=None, now=None):
+    if not isinstance(data, dict):
+        raise ValueError("CLOB book response is not an object")
+    expected = str(token_id)
+    asset = data.get("asset_id")
+    if asset is None or str(asset) != expected:
+        raise ValueError("CLOB book asset_id does not match the requested token")
+    try:
+        ts_ms = int(data["timestamp"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("CLOB book has no valid exchange timestamp") from exc
+    if ts_ms <= 0:
+        raise ValueError("CLOB book has a non-positive exchange timestamp")
+    wall = timer.wall() if now is None else _number(
+        "now", now, minimum=0, inclusive_min=True)
+    age = wall - ts_ms / 1000.0
+    limit = _number(
+        "max_age_s",
+        config.ORDERBOOK_MAX_AGE_SECONDS if max_age_s is None else max_age_s,
+        minimum=0,
+    )
+    if age < -5.0 or age > limit:
+        raise ValueError(f"CLOB book is stale or future-dated (age={age:.3f}s)")
+
+    bids = _levels(data.get("bids"), "bid")
+    asks = _levels(data.get("asks"), "ask")
+    if not bids and not asks:
+        raise ValueError("CLOB book is empty")
+    if bids and asks and float(bids[0]["price"]) >= float(asks[0]["price"]):
+        raise ValueError("CLOB book is crossed or locked")
+    return bids, asks
+
+
+def get_orderbook(token_id, timeout=8.0):
+    token = str(token_id or "")
+    if not token.isdigit() or int(token) <= 0:
+        raise ValueError("invalid CLOB token id")
+    timeout = _number("timeout", timeout, minimum=0)
+    last_error = None
+    for attempt in range(2):
+        try:
+            resp = http_pool.get(BOOK_URL, params={"token_id": token}, timeout=timeout)
+            status = int(getattr(resp, "status_code", 200) or 0)
+            if status == 429 or 500 <= status <= 599:
+                resp.raise_for_status()
+            resp.raise_for_status()
+            return parse_orderbook(resp.json(), token)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+        except requests.HTTPError as exc:
+            last_error = exc
+            status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+            if status != 429 and not 500 <= status <= 599:
+                raise
+        if attempt == 0:
+            # The read runs in a worker thread, so a short bounded backoff does
+            # not stall the asyncio loop.  Final freshness/expiry checks in the
+            # caller still fail closed if the retry takes too long.
+            time.sleep(0.1)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("CLOB book request failed without an error")
+
+
+def liquidity_signal(bids, asks):
+    def volume(levels):
+        total, count = 0.0, 0
+        for level in levels or ():
+            try:
+                size = float(level.get("size"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(size) and size > 0:
+                candidate = total + size
+                if not math.isfinite(candidate):
+                    return 0.0, 0
+                total = candidate
+                count += 1
+        return total, count
+
+    bid_volume, bid_count = volume(bids)
+    ask_volume, ask_count = volume(asks)
+    # A one-sided book is not a depth comparison.  Near expiry the winning
+    # token keeps only bids and the losing token only asks, so an empty side
+    # would otherwise cast a confident vote for the token that cannot be
+    # bought at all.  Abstain and let the other signals decide.
+    if not bid_count or not ask_count:
+        return None
+    return "UP" if bid_volume >= ask_volume else "DOWN"
+
+
+def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.0):
+    """Fail closed before signing when the selected token is unfillable/unsafe."""
+    amount = _number("amount", amount, minimum=0)
+    max_price = _number("max_price", max_price, minimum=0, maximum=1)
+    min_price = _number(
+        "min_price", min_price, minimum=0, maximum=1, inclusive_min=True)
+    max_spread = _number("max_spread", max_spread, minimum=0, maximum=1)
+    if min_price >= max_price:
+        raise ValueError("min_price must be below max_price")
+    bids, asks = get_orderbook(token_id)
+    if not asks:
+        raise ValueError("selected token has no asks")
+    best_ask = float(asks[0]["price"])
+    if best_ask > max_price:
+        raise ValueError(f"best ask {best_ask} exceeds MAX_BUY_PRICE {max_price}")
+    if best_ask < min_price:
+        raise ValueError(f"best ask {best_ask} is below MIN_BUY_PRICE {min_price}")
+    if not bids:
+        raise ValueError("selected token has no bids; spread cannot be validated")
+    spread = best_ask - float(bids[0]["price"])
+    if spread > max_spread:
+        raise ValueError(f"spread {spread:.6f} exceeds limit {max_spread:.6f}")
+    available = sum(
+        float(level["price"]) * float(level["size"])
+        for level in asks if float(level["price"]) <= max_price
+    )
+    if not math.isfinite(available):
+        raise ValueError("FOK preflight depth is non-finite")
+    if available + 1e-9 < amount:
+        raise ValueError(
+            f"FOK preflight: only ${available:.6f} available at or below {max_price}")
+    return bids, asks

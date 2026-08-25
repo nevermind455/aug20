@@ -1,0 +1,62 @@
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+*.seed
+
+# Wallet/order/accounting state (may contain identifiers and balances)
+ledger.json
+paper_account.json
+paper_ledger.json
+paper_orders.jsonl
+paper_trade_log.csv
+*.lock
+.btc_bot_*.lock
+
+# Runtime diagnostics
+*.log
+watch_report.txt
+
+# Local runtimes and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage*
+
+# Editor/OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Renamed/experiment runtime state. Same class as the paper_* files above -
+# balances, positions and realised PnL - just written to a configured path.
+signal_flip_v1_*
+*_ledger.json
+*_account.json
+*_orders.jsonl
+*_fills.csv
+signal_journal.csv
+signal_journal_winners.json
+
+# Archived runs of the state files above.
+archive/
+
+# Third-party wallet history pulled from the public data API for analysis.
+# Public on-chain data, but republishing someone's full trade record is a
+# deliberate act, not a side effect of committing the bot.
+wallet_activity.json
+wallet2_activity.json
+wallet_positions.json
+
+# Editor/tooling backups.
+*.bak
+*.bak[0-9]

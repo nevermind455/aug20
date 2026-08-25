@@ -1,0 +1,15 @@
+requests>=2.31.0,<3
+websockets>=12.0,<16
+python-dotenv>=1.0.0,<2
+# Windows Python has no built-in IANA tz database; ZoneInfo("America/New_York")
+# needs this package. Harmless on Linux/macOS.
+tzdata>=2024.1
+py-clob-client-v2>=1.1.0,<2
+# py-clob-client-v2 imports httpx's configured proxy transport at import
+# time. Include SOCKS support so environments with ALL_PROXY do not crash.
+socksio>=1.0.0,<2
+# On-chain settlement reads payoutNumerators from the Polygon Conditional
+# Tokens contract, which resolves ~85s after a round versus ~10min for the
+# CLOB/Gamma mirrors. Optional at runtime: without it SETTLE_ONCHAIN fails
+# closed and settlement falls back to those APIs.
+web3>=7.0.0,<8

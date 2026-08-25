@@ -1,0 +1,987 @@
+"""Credential-free paper execution against the live public CLOB book.
+
+Paper mode deliberately lives outside :mod:`polymarket_trade`.  It never
+constructs a ``ClobClient``, reads a private key, derives API credentials,
+creates a signature, or calls an order/cancel/account endpoint.
+
+The simulator models the live bot's FOK market BUY:
+
+* fetch the selected outcome's public order book at submission time;
+* walk asks from best to worst, enforcing ``MIN_BUY_PRICE`` and ``MAX_BUY_PRICE``;
+* fill the whole dollar amount or reject it (no partial FOK fills);
+* enforce the venue-reported minimum order size;
+* apply the venue's public fee curve at every consumed price level;
+* record only successful simulated fills in the persistent Ledger;
+* let the normal SettlementWorker settle from Polymarket's resolution.
+
+This is realistic paper execution, not a promise that a live order would get
+the same fill.  Network latency and queue movement between observation and a
+real matcher acknowledgement cannot be recreated without placing an order.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, ROUND_UP
+from pathlib import Path
+from typing import Callable
+from urllib.parse import urlsplit
+
+import requests
+
+import http_pool
+
+import timer
+from accounting.ledger import Ledger, _fsync_directory
+
+
+MONEY = Decimal("0.000001")
+FEE_PRECISION = Decimal("0.00001")
+ZERO = Decimal("0")
+ONE = Decimal("1")
+
+
+@dataclass(frozen=True)
+class BookSnapshot:
+    token_id: str
+    asks: tuple[tuple[Decimal, Decimal], ...]  # price, available shares
+    min_order_size: Decimal | None = None
+    tick_size: Decimal | None = None
+    timestamp: str | None = None
+    book_hash: str | None = None
+    received_wall: float = 0.0
+    best_bid: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class MarketRules:
+    condition_id: str
+    fee_rate: Decimal
+    fee_exponent: int = 1
+    min_order_size: Decimal | None = None
+    tick_size: Decimal | None = None
+    source: str = "venue"
+    up_token_id: str | None = None
+    down_token_id: str | None = None
+    # None means the venue says a delay feature exists but did not disclose
+    # the actual delay. Paper execution must then fail closed instead of
+    # inventing a duration.
+    taker_delay_ms: float | None = 0.0
+
+
+@dataclass(frozen=True)
+class FillQuote:
+    notional: Decimal
+    shares: Decimal
+    average_price: Decimal
+    worst_price: Decimal
+    fee: Decimal
+    levels: tuple[tuple[Decimal, Decimal, Decimal], ...]  # price, shares, notional
+
+    @property
+    def total_cost(self) -> Decimal:
+        return self.notional + self.fee
+
+
+class PaperRejected(RuntimeError):
+    """A paper FOK that would not be accepted/filled under the model."""
+
+
+def _pre_submit_guard_error(pre_submit_guard) -> str | None:
+    """Return a stable rejection reason unless an optional guard says True."""
+    if pre_submit_guard is None:
+        return None
+    if not callable(pre_submit_guard):
+        return "pre-submit guard is not callable"
+    try:
+        allowed = pre_submit_guard()
+    except Exception as exc:
+        # The callback may close over credentials or remote messages.  Its
+        # exception text does not belong in the durable paper audit journal.
+        return f"pre-submit guard failed closed: {type(exc).__name__}"
+    if allowed is not True:
+        return "pre-submit guard rejected order"
+    return None
+
+
+def _require_https_origin(host: str) -> None:
+    parsed = urlsplit(str(host or ""))
+    if (parsed.scheme != "https" or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise PaperRejected("public CLOB host must be a clean HTTPS origin")
+
+
+def _decimal(value, *, name: str) -> Decimal:
+    try:
+        out = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise PaperRejected(f"invalid {name}: {value!r}") from exc
+    if not out.is_finite():
+        raise PaperRejected(f"invalid {name}: {value!r}")
+    return out
+
+
+def parse_book(data: dict, expected_token: str) -> BookSnapshot:
+    """Validate and normalise one public ``GET /book`` response."""
+    if not isinstance(data, dict):
+        raise PaperRejected("public order book returned a non-object")
+    if data.get("asset_id") is None:
+        raise PaperRejected("public order book omitted asset_id")
+    token = str(data.get("asset_id"))
+    if token != str(expected_token):
+        raise PaperRejected("public order book token does not match this order")
+
+    aggregated: dict[Decimal, Decimal] = {}
+    for raw in data.get("asks") or ():
+        try:
+            price = _decimal(raw.get("price") if isinstance(raw, dict) else raw[0],
+                             name="ask price")
+            size = _decimal(raw.get("size") if isinstance(raw, dict) else raw[1],
+                            name="ask size")
+        except (PaperRejected, IndexError, KeyError, TypeError) as exc:
+            raise PaperRejected("public order book has a malformed ask level") from exc
+        if not ZERO < price < ONE or size <= ZERO:
+            raise PaperRejected("public order book has an out-of-range ask level")
+        aggregated[price] = aggregated.get(price, ZERO) + size
+    asks = tuple(sorted(aggregated.items(), key=lambda level: level[0]))
+
+    bids: list[Decimal] = []
+    for raw in data.get("bids") or ():
+        try:
+            price = _decimal(raw.get("price") if isinstance(raw, dict) else raw[0],
+                             name="bid price")
+            size = _decimal(raw.get("size") if isinstance(raw, dict) else raw[1],
+                            name="bid size")
+        except (PaperRejected, IndexError, KeyError, TypeError) as exc:
+            raise PaperRejected("public order book has a malformed bid level") from exc
+        if not ZERO < price < ONE or size <= ZERO:
+            raise PaperRejected("public order book has an out-of-range bid level")
+        bids.append(price)
+    best_bid = max(bids) if bids else None
+    if asks and best_bid is not None and best_bid >= asks[0][0]:
+        raise PaperRejected("public order book is crossed or locked")
+
+    def optional_decimal(*names):
+        for name in names:
+            value = data.get(name)
+            if value not in (None, ""):
+                parsed = _decimal(value, name=name)
+                if parsed <= ZERO:
+                    raise PaperRejected(f"public order book has invalid {name}")
+                return parsed
+        return None
+
+    timestamp = data.get("timestamp")
+    try:
+        timestamp_ms = int(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise PaperRejected("public order book omitted a valid exchange timestamp") from exc
+    if timestamp_ms <= 0:
+        raise PaperRejected("public order book has an invalid exchange timestamp")
+
+    return BookSnapshot(
+        token_id=token,
+        asks=asks,
+        best_bid=best_bid,
+        min_order_size=optional_decimal("min_order_size", "minimum_order_size"),
+        tick_size=optional_decimal("tick_size", "minimum_tick_size"),
+        timestamp=str(timestamp_ms),
+        book_hash=str(data.get("hash")) if data.get("hash") is not None else None,
+        received_wall=timer.wall(),
+    )
+
+
+def fetch_public_book(token_id: str, *, host: str, timeout: float = 8.0) -> BookSnapshot:
+    """Read the unauthenticated CLOB book. No wallet material is involved."""
+    _require_https_origin(host)
+    response = http_pool.get(f"{host.rstrip('/')}/book",
+                             params={"token_id": str(token_id)}, timeout=timeout)
+    response.raise_for_status()
+    return parse_book(response.json(), str(token_id))
+
+
+def snapshot_from_book_view(view, *, expected_token: str | None = None) -> BookSnapshot:
+    """Turn a LIVE websocket ``BookView`` into the paper FOK snapshot."""
+    token = str(getattr(view, "token", "") or "")
+    if expected_token is not None and token != str(expected_token):
+        raise PaperRejected("public order book token does not match this order")
+    aggregated: dict[Decimal, Decimal] = {}
+    for level in getattr(view, "asks", ()) or ():
+        try:
+            price = _decimal(level[0], name="ask price")
+            size = _decimal(level[1], name="ask size")
+        except (IndexError, TypeError) as exc:
+            raise PaperRejected("public order book has a malformed ask level") from exc
+        if not ZERO < price < ONE or size <= ZERO:
+            raise PaperRejected("public order book has an out-of-range ask level")
+        aggregated[price] = aggregated.get(price, ZERO) + size
+    asks = tuple(sorted(aggregated.items(), key=lambda item: item[0]))
+    best_bid_raw = getattr(view, "best_bid", None)
+    best_bid = (_decimal(best_bid_raw, name="bid")
+                if best_bid_raw is not None else None)
+    if best_bid is not None and not ZERO < best_bid < ONE:
+        raise PaperRejected("public order book has an out-of-range bid")
+    if asks and best_bid is not None and best_bid >= asks[0][0]:
+        raise PaperRejected("public order book is crossed or locked")
+    ts = getattr(view, "exchange_ts_ms", None)
+    if ts is None:
+        raise PaperRejected("websocket order book omitted exchange timestamp")
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError) as exc:
+        raise PaperRejected("websocket order book has an invalid exchange timestamp") from exc
+    if ts <= 0:
+        raise PaperRejected("websocket order book has an invalid exchange timestamp")
+    tick_raw = getattr(view, "tick_size", None)
+    tick = (_decimal(tick_raw, name="tick")
+            if tick_raw not in (None, "") else None)
+    if tick is not None and not ZERO < tick < ONE:
+        raise PaperRejected("websocket order book has an invalid tick size")
+    digest = getattr(view, "hash", None)
+    return BookSnapshot(
+        token_id=token,
+        asks=asks,
+        best_bid=best_bid,
+        tick_size=tick,
+        timestamp=str(int(ts)),
+        book_hash=str(digest) if digest else None,
+        received_wall=timer.wall(),
+    )
+
+
+def fetch_executable_book(token_id: str, *, host: str, ws_view=None,
+                          timeout: float = 8.0) -> BookSnapshot:
+    """Prefer a LIVE websocket book that still has asks; else public REST."""
+    token = str(token_id)
+    if ws_view is not None and getattr(ws_view, "asks", None):
+        status = str(getattr(ws_view, "status", "") or "")
+        if status == "LIVE":
+            try:
+                snap = snapshot_from_book_view(ws_view, expected_token=token)
+                if snap.asks:
+                    return snap
+            except PaperRejected:
+                pass
+    return fetch_public_book(token, host=host, timeout=timeout)
+
+
+def parse_market_rules(data: dict, condition_id: str, *, category: str = "crypto",
+                       market_data: dict | None = None) -> MarketRules:
+    """Parse public V2 CLOB parameters; unknown fees are not simulated."""
+    if not isinstance(data, dict):
+        raise PaperRejected("CLOB market rules returned a non-object")
+    fd = data.get("fd") if isinstance(data.get("fd"), dict) else {}
+    source = "venue"
+    try:
+        rate = _decimal(fd.get("r"), name="fee rate")
+        exponent_raw = fd.get("e", 1)
+        if isinstance(exponent_raw, bool):
+            raise ValueError
+        exponent_decimal = _decimal(exponent_raw, name="fee exponent")
+        if exponent_decimal != exponent_decimal.to_integral_value():
+            raise ValueError
+        exponent = int(exponent_decimal)
+        if (rate <= ZERO or rate > ONE or not 1 <= exponent <= 8
+                or fd.get("to") is not True):
+            raise ValueError
+    except (PaperRejected, TypeError, ValueError) as exc:
+        raise PaperRejected("CLOB market omitted valid live fee parameters") from exc
+
+    def optional(key):
+        if data.get(key) in (None, ""):
+            return None
+        out = _decimal(data.get(key), name=key)
+        if out <= ZERO:
+            raise PaperRejected(f"CLOB market has invalid {key}")
+        return out
+
+    token_rows = data.get("t")
+    if not isinstance(token_rows, list) or len(token_rows) != 2:
+        raise PaperRejected("CLOB market rules do not describe a binary market")
+    labelled = {}
+    for row in token_rows:
+        if not isinstance(row, dict):
+            raise PaperRejected("invalid CLOB token mapping")
+        label = str(row.get("o") or "").strip().lower()
+        if label in labelled:
+            raise PaperRejected("duplicate CLOB outcome label")
+        labelled[label] = str(row.get("t") or "")
+    if (set(labelled) != {"up", "down"} or not all(labelled.values())
+            or labelled["up"] == labelled["down"]):
+        raise PaperRejected("CLOB outcomes are not exactly UP and DOWN")
+    taker_delay_ms: float | None
+    if "itode" in data and not isinstance(data.get("itode"), bool):
+        raise PaperRejected("CLOB market has invalid matching-delay flag")
+    if market_data is None:
+        taker_delay_ms = None if data.get("itode") is True else 0.0
+    else:
+        returned_condition = str(market_data.get("condition_id") or "")
+        if returned_condition and returned_condition != str(condition_id):
+            raise PaperRejected("public market metadata condition mismatch")
+        rows = market_data.get("tokens")
+        if not isinstance(rows, list) or len(rows) != 2:
+            raise PaperRejected("public market metadata is not binary")
+        metadata_tokens = {
+            str(row.get("outcome") or "").strip().lower(): str(row.get("token_id") or "")
+            for row in rows if isinstance(row, dict)
+        }
+        if metadata_tokens != labelled:
+            raise PaperRejected("public market endpoints disagree on UP/DOWN mapping")
+        try:
+            if isinstance(market_data.get("seconds_delay"), bool):
+                raise TypeError
+            seconds_delay = float(market_data.get("seconds_delay"))
+        except (TypeError, ValueError) as exc:
+            raise PaperRejected("public market metadata omitted the matching delay") from exc
+        if not math.isfinite(seconds_delay) or not 0 <= seconds_delay <= 60:
+            raise PaperRejected("public market metadata has an invalid matching delay")
+        taker_delay_ms = seconds_delay * 1000.0
+
+    minimum, tick = optional("mos"), optional("mts")
+    if minimum is None or tick is None or tick >= ONE:
+        raise PaperRejected("CLOB market omitted valid minimum-size/tick rules")
+
+    return MarketRules(
+        str(condition_id), rate, exponent,
+        min_order_size=minimum, tick_size=tick, source=source,
+        up_token_id=labelled["up"], down_token_id=labelled["down"],
+        taker_delay_ms=taker_delay_ms,
+    )
+
+
+def fetch_market_rules(condition_id: str, *, host: str, category: str = "crypto",
+                       timeout: float = 8.0) -> MarketRules:
+    """Read and cross-check both unauthenticated market parameter surfaces."""
+    _require_https_origin(host)
+    response = http_pool.get(
+        f"{host.rstrip('/')}/clob-markets/{condition_id}", timeout=timeout)
+    response.raise_for_status()
+    metadata = http_pool.get(
+        f"{host.rstrip('/')}/markets/{condition_id}", timeout=timeout)
+    metadata.raise_for_status()
+    return parse_market_rules(
+        response.json(), str(condition_id), category=category,
+        market_data=metadata.json())
+
+
+def curve_fee(shares: Decimal, price: Decimal, rules: MarketRules) -> Decimal:
+    """V2 fee curve: shares * rate * (price * (1-price)) ** exponent."""
+    raw = shares * rules.fee_rate * (price * (ONE - price)) ** rules.fee_exponent
+    return raw.quantize(FEE_PRECISION, rounding=ROUND_HALF_UP)
+
+
+def size_to_venue_minimum(amount, book: BookSnapshot, rules: MarketRules,
+                          max_price) -> Decimal:
+    """Raise a dollar stake just enough to buy the venue's minimum shares."""
+    wanted = _decimal(amount, name="amount").quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
+    if not minimums or not book.asks:
+        return wanted
+    minimum = max(minimums)
+    tick = rules.tick_size
+    if tick is None or not ZERO < tick < ONE:
+        return wanted
+    configured_cap = _decimal(max_price, name="maximum buy price")
+    cap = min(configured_cap, ONE - tick)
+    cap = (cap / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    best = book.asks[0][0]
+    if best > cap or best <= ZERO:
+        return wanted
+    required = (minimum * best).quantize(Decimal("0.01"), rounding=ROUND_UP)
+    return wanted if wanted >= required else required
+
+
+def estimate_fok(book: BookSnapshot, amount, max_price,
+                 rules: MarketRules, min_price=0) -> FillQuote:
+    """Walk live asks and return a full-fill quote or raise ``PaperRejected``."""
+    wanted = _decimal(amount, name="amount").quantize(MONEY, rounding=ROUND_HALF_UP)
+    configured_cap = _decimal(max_price, name="maximum buy price")
+    configured_floor = _decimal(min_price, name="minimum buy price")
+    if wanted <= ZERO:
+        raise PaperRejected("paper amount must be positive")
+    if not ZERO < configured_cap < ONE:
+        raise PaperRejected("maximum buy price must be between 0 and 1")
+    if configured_floor < ZERO or configured_floor >= configured_cap:
+        raise PaperRejected("minimum buy price must be below the maximum buy price")
+    tick = rules.tick_size
+    if tick is None or not ZERO < tick < ONE:
+        raise PaperRejected("paper market has no valid venue tick size")
+    if book.tick_size is not None and book.tick_size != tick:
+        raise PaperRejected("public book and market rules disagree on tick size")
+    cap = min(configured_cap, ONE - tick)
+    cap = (cap / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    if cap <= ZERO:
+        raise PaperRejected("maximum buy price is below one venue tick")
+    floor = ZERO if configured_floor <= ZERO else (
+        (configured_floor / tick).to_integral_value(rounding=ROUND_CEILING) * tick)
+    if not book.asks:
+        raise PaperRejected("cannot FOK buy: no asks on the live book")
+    if book.asks[0][0] < floor:
+        raise PaperRejected(
+            f"best ask {book.asks[0][0]} is below MIN_BUY_PRICE {floor}")
+
+    remaining = wanted
+    total_shares = ZERO
+    total_fee = ZERO
+    used: list[tuple[Decimal, Decimal, Decimal]] = []
+    worst = ZERO
+    for price, available_shares in book.asks:
+        if price > cap:
+            break
+        available_notional = price * available_shares
+        spend = min(remaining, available_notional)
+        if spend <= ZERO:
+            continue
+        shares = spend / price
+        used.append((price, shares, spend))
+        total_shares += shares
+        total_fee += curve_fee(shares, price, rules)
+        remaining -= spend
+        worst = price
+        if remaining <= MONEY / Decimal("2"):
+            remaining = ZERO
+            break
+
+    if remaining > ZERO:
+        available = wanted - remaining
+        raise PaperRejected(
+            f"FOK no-fill: only ${available:.6f} available at or below {cap}")
+
+    minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
+    minimum = max(minimums) if minimums else None
+    if minimum is not None and total_shares < minimum:
+        raise PaperRejected(
+            f"order size {total_shares:.6f} shares is below venue minimum {minimum}")
+
+    total_fee = total_fee.quantize(FEE_PRECISION, rounding=ROUND_HALF_UP)
+    return FillQuote(wanted, total_shares, wanted / total_shares, worst,
+                     total_fee, tuple(used))
+
+
+class PaperBroker:
+    """Persistent paper cash, fills and venue-resolution PnL."""
+
+    mode = "PAPER"
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        *,
+        market_context: Callable[[], dict],
+        host: str,
+        max_buy_price: float,
+        min_buy_price: float = 0.0,
+        start_balance: float = 1000.0,
+        account_path: str | os.PathLike | None = None,
+        audit_path: str | os.PathLike | None = None,
+        book_fetch: Callable[[str], BookSnapshot] | None = None,
+        rules_fetch: Callable[[str], MarketRules] | None = None,
+        category: str = "crypto",
+        latency_ms: float = 0.0,
+        max_book_age_s: float = 8.0,
+        max_spread: float = 0.25,
+        min_seconds_to_expiry: float = 1.0,
+        trade_window_seconds: float = 60.0,
+        on_event=None,
+    ) -> None:
+        self.ledger = ledger
+        self.market_context = market_context
+        self.host = host
+        self.max_buy_price = float(max_buy_price)
+        self.min_buy_price = float(min_buy_price)
+        self.category = category
+        self.latency_ms = float(latency_ms)
+        self.max_book_age_s = float(max_book_age_s)
+        self.max_spread = float(max_spread)
+        self.min_seconds_to_expiry = float(min_seconds_to_expiry)
+        self.trade_window_seconds = float(trade_window_seconds)
+        if (not 0 <= self.latency_ms < 60_000 or self.max_book_age_s <= 0
+                or not 0 < self.max_spread <= 1
+                or not 0 <= self.min_seconds_to_expiry < 300
+                or not self.min_seconds_to_expiry < self.trade_window_seconds <= 300
+                or not 0 <= self.min_buy_price < self.max_buy_price < 1):
+            raise ValueError("invalid paper latency/book-age/spread configuration")
+        self.on_event = on_event
+        base = Path(ledger.path).resolve().parent
+        self.account_path = Path(account_path or base / "paper_account.json")
+        self.audit_path = Path(audit_path or base / "paper_orders.jsonl")
+        state_paths = {
+            Path(self.ledger.path).resolve(), self.account_path.resolve(),
+            self.audit_path.resolve(),
+        }
+        if len(state_paths) != 3:
+            raise ValueError("paper ledger, account, and audit paths must be distinct")
+        self._book_fetch = book_fetch or (
+            lambda token: fetch_public_book(token, host=self.host))
+        self._rules_fetch = rules_fetch or (
+            lambda cid: fetch_market_rules(cid, host=self.host, category=self.category))
+        self._lock = threading.RLock()
+        self._execution_lock = threading.Lock()
+        # condition_id -> (MarketRules, fetched_wall). See _rules().
+        self._rules_cache: dict[str, tuple] = {}
+        self._rules_cache_ttl = 300.0
+        self.last_error: str | None = None
+        self.last_fill: dict | None = None
+        self.filled_orders = 0
+        self.rejected_orders = 0
+        self.started_wall = time.time()
+        self.start_balance = self._load_or_create_account(start_balance)
+
+    # --------------------------------------------------------- account
+    def _load_or_create_account(self, requested) -> float:
+        requested_d = _decimal(requested, name="paper starting balance")
+        if requested_d <= ZERO:
+            raise ValueError("PAPER_START_BALANCE must be positive")
+        try:
+            data = json.loads(self.account_path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict)
+                    or type(data.get("version")) is not int
+                    or data.get("version") not in (1, 2)):
+                raise ValueError("unsupported paper account schema")
+            created = float(data["created_at"])
+            if not math.isfinite(created) or created <= 0:
+                raise ValueError("invalid paper account creation timestamp")
+            saved = _decimal(data["starting_balance"], name="saved paper starting balance")
+            if saved <= ZERO:
+                raise ValueError("invalid saved paper starting balance")
+
+            # An account file proves that a ledger previously existed.  If the
+            # ledger is now absent, accepting a newly constructed empty Ledger
+            # would erase every fill and make cash jump back to starting cash.
+            if not self.ledger.loaded_from_disk:
+                raise ValueError(
+                    "paper account exists but its ledger file is missing; "
+                    "restore the matching ledger")
+
+            if data["version"] == 1:
+                self._validate_legacy_account_pair(data, created)
+                self._ensure_ledger_identity_durable()
+                self._atomic_json(self._account_payload(created, saved))
+            else:
+                saved_id = str(data.get("ledger_id") or "")
+                if (self.ledger.schema_version != 4
+                        or saved_id != self.ledger.ledger_id):
+                    raise ValueError(
+                        "paper account and ledger identities do not match; "
+                        "restore them as a pair")
+                # ledger_path is diagnostic in V2; identity, not location,
+                # owns the pairing.  Refresh it after a safe directory move.
+                if str(data.get("ledger_path") or "") != self._ledger_path_text():
+                    self._atomic_json(self._account_payload(created, saved))
+            return float(saved)
+        except FileNotFoundError:
+            data = None
+        except Exception as exc:
+            raise RuntimeError(
+                f"invalid paper state pair at {self.account_path}: {exc}") from exc
+        if (self.ledger.seen or self.ledger.positions
+                or self.ledger.authorized_orders):
+            raise RuntimeError(
+                "paper ledger contains fills but paper_account.json is missing; "
+                "restore the account file instead of guessing a starting balance")
+        self._ensure_ledger_identity_durable()
+        self._atomic_json(self._account_payload(time.time(), requested_d))
+        return float(requested_d)
+
+    def _ledger_path_text(self) -> str:
+        return str(Path(self.ledger.path).resolve())
+
+    def _account_payload(self, created, balance) -> dict:
+        return {
+            "version": 2,
+            "created_at": float(created),
+            "starting_balance": float(balance),
+            "ledger_id": self.ledger.ledger_id,
+            # Kept for operator diagnostics only.  The random ledger_id is the
+            # durable pairing key, so moving this whole directory is safe.
+            "ledger_path": self._ledger_path_text(),
+            "note": "Cash is derived from ledger fills and venue-settled payouts.",
+        }
+
+    def _ensure_ledger_identity_durable(self) -> None:
+        if (self.ledger.schema_version == 4
+                and Path(self.ledger.path).is_file()):
+            return
+        if not self.ledger.save():
+            detail = self.ledger.last_persistence_error or "unknown persistence failure"
+            raise RuntimeError(f"paper ledger identity could not be saved: {detail}")
+
+    def _validate_legacy_account_pair(self, data: dict, created: float) -> None:
+        """Safely bind a path-based V1 account once, then migrate it to V2.
+
+        A matching old path is the normal upgrade.  If the whole state
+        directory was moved before upgrade, creation times prove an empty
+        ledger pair; a non-empty ledger additionally has to match the durable
+        FILLED audit IDs.  Ambiguous mixes fail closed for operator recovery.
+        """
+        saved_ledger = Path(str(data["ledger_path"])).resolve()
+        current_ledger = Path(self.ledger.path).resolve()
+        account_parent = self.account_path.resolve().parent
+        creation_gap = created - float(self.ledger.opened_wall)
+        if not 0 <= creation_gap <= 2.0:
+            raise ValueError(
+                "legacy paper account creation does not match this ledger")
+        if (saved_ledger != current_ledger
+                and (saved_ledger.name != current_ledger.name
+                     or account_parent != current_ledger.parent)):
+            raise ValueError(
+                "legacy paper account points at another ledger and cannot be "
+                "safely migrated")
+        if self.ledger.seen:
+            try:
+                rows = [json.loads(line) for line in
+                        self.audit_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()]
+                fill_ids = [str(row.get("order_id") or "") for row in rows
+                            if isinstance(row, dict) and row.get("status") == "FILLED"]
+            except Exception as exc:
+                raise ValueError(
+                    "legacy moved ledger has no valid matching paper audit") from exc
+            if (len(fill_ids) != len(set(fill_ids))
+                    or set(fill_ids) != set(self.ledger.seen)):
+                raise ValueError(
+                    "legacy moved ledger does not match the paper audit")
+
+    def _atomic_json(self, payload: dict) -> None:
+        self.account_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.account_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.account_path)
+            _fsync_directory(self.account_path.parent)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError as cleanup_exc:
+                self.last_error = (
+                    f"paper account temp cleanup failed: {type(cleanup_exc).__name__}")
+            raise
+
+    def cash_balance(self) -> float:
+        """Starting cash - all fill costs + payouts from resolved positions."""
+        with self.ledger._lock:
+            spent = sum(position.cost for position in self.ledger.positions.values())
+            payouts = sum(
+                position.shares * float(position.payout_per_share or 0.0)
+                for position in self.ledger.positions.values() if position.settled)
+        return self.start_balance - spent + payouts
+
+    def get_balance_allowance(self) -> dict:
+        cash = self.cash_balance()
+        return {"balance": cash, "allowance": cash, "paper": True}
+
+    def cancel_all_open_orders(self) -> bool:
+        # Every simulated order is FOK and therefore terminal immediately.
+        self.last_error = None
+        print("[PAPER] No resting orders to cancel (paper orders are immediate FOK).")
+        return True
+
+    # --------------------------------------------------------- execution
+    def _context(self) -> tuple[str, str | None, str | None]:
+        context = self.market_context() or {}
+        condition = str(context.get("condition_id") or "")
+        if not condition:
+            raise PaperRejected("missing current condition id; cannot settle paper PnL")
+        up = str(context.get("up_token_id")) if context.get("up_token_id") else None
+        down = str(context.get("down_token_id")) if context.get("down_token_id") else None
+        return condition, up, down
+
+    def _rules(self, condition_id: str) -> MarketRules:
+        """Venue parameters for one market, cached for the market's lifetime.
+
+        Every field on MarketRules - fee rate and exponent, minimum size, tick,
+        taker delay - is fixed when the market is created, yet this used to be
+        re-fetched on every fill: two HTTP calls per order, six per cycle once
+        the multi-signal legs are on, all returning identical bytes. Measured
+        against the live venue those calls run 0.5s normally but spike past
+        8653ms, and the fetch's own timeout is 8.0s - so the spike surfaced as
+        "cannot read live market rules: ReadTimeout" and cost the order.
+
+        The cache is per condition and time-bounded. A five-minute market never
+        outlives one entry, and the TTL means a genuinely changed parameter is
+        picked up rather than pinned for the life of the process.
+        """
+        key = str(condition_id or "")
+        now = time.time()
+        with self._lock:
+            hit = self._rules_cache.get(key)
+            if hit is not None and now - hit[1] <= self._rules_cache_ttl:
+                return hit[0]
+        try:
+            rules = self._rules_fetch(condition_id)
+        except Exception as exc:
+            # Fail closed on unknown V2 market parameters. A guessed fee or
+            # minimum size would make the paper PnL look more exact than it is.
+            raise PaperRejected(f"cannot read live market rules: {type(exc).__name__}") from exc
+        if not isinstance(rules, MarketRules):
+            raise PaperRejected("invalid live market rules response")
+        with self._lock:
+            self._rules_cache[key] = (rules, now)
+            if len(self._rules_cache) > 64:
+                for stale in sorted(self._rules_cache,
+                                    key=lambda k: self._rules_cache[k][1])[:32]:
+                    del self._rules_cache[stale]
+        return rules
+
+    def place_trade(self, side: str, amount: float,
+                    up_token_id: str | None = None,
+                    down_token_id: str | None = None,
+                    condition_id: str | None = None,
+                    window_end: float | None = None,
+                    max_price: float | None = None, *,
+                    pre_submit_guard=None) -> bool:
+        """Run one simulated FOK; reject concurrent duplicate submissions.
+
+        `max_price` caps this order only. A caller trading a price band needs
+        the walk to stop at the band's top, not at the account-wide ceiling:
+        a thin best level would otherwise fill outside the band being traded.
+        An optional `pre_submit_guard` must return literal ``True`` after the
+        modeled delay and quote, immediately before the durable paper fill.
+        """
+        if not self._execution_lock.acquire(blocking=False):
+            return self._reject(side, amount, "another paper order is already in flight")
+        try:
+            return self._place_trade(side, amount, up_token_id, down_token_id,
+                                     condition_id, window_end, max_price,
+                                     pre_submit_guard=pre_submit_guard)
+        finally:
+            self._execution_lock.release()
+
+    def _place_trade(self, side: str, amount: float,
+                     up_token_id: str | None = None,
+                     down_token_id: str | None = None,
+                     condition_id: str | None = None,
+                     window_end: float | None = None,
+                     max_price: float | None = None, *,
+                     pre_submit_guard=None) -> bool:
+        side = str(side or "").upper()
+        if side not in ("UP", "DOWN"):
+            return self._reject(side, amount, "invalid side")
+        token_id = up_token_id if side == "UP" else down_token_id
+        if not token_id:
+            return self._reject(side, amount, "missing token id")
+
+        try:
+            try:
+                end = float(window_end)
+            except (TypeError, ValueError) as exc:
+                raise PaperRejected("missing current round end timestamp") from exc
+            now_wall = timer.wall()
+            if not end - self.trade_window_seconds <= now_wall < end - self.min_seconds_to_expiry:
+                raise PaperRejected("paper order is outside the current round execution interval")
+            context_condition, context_up, context_down = self._context()
+            if condition_id and str(condition_id) != context_condition:
+                raise PaperRejected("condition does not belong to the current paper round")
+            condition_id = context_condition
+            expected = context_up if side == "UP" else context_down
+            if expected and str(token_id) != expected:
+                raise PaperRejected("token does not belong to the current paper round")
+            rules = self._rules(condition_id)
+            if (rules.up_token_id != context_up or rules.down_token_id != context_down):
+                raise PaperRejected("Gamma and CLOB disagree on UP/DOWN token mapping")
+            if rules.taker_delay_ms is None:
+                raise PaperRejected(
+                    "venue matching delay is unknown; realistic paper fill is impossible")
+            assumed_latency_ms = self.latency_ms + rules.taker_delay_ms
+            cutoff = end - self.min_seconds_to_expiry
+            if timer.wall() + assumed_latency_ms / 1000.0 >= cutoff:
+                raise PaperRejected("not enough time remaining for paper latency before cutoff")
+            if assumed_latency_ms:
+                time.sleep(assumed_latency_ms / 1000.0)
+            if timer.wall() >= cutoff:
+                raise PaperRejected("paper latency reached the round cutoff")
+            book = self._book_fetch(str(token_id))
+            if not isinstance(book, BookSnapshot):
+                raise PaperRejected("invalid public order book response")
+            if book.timestamp is None:
+                raise PaperRejected("public order book omitted exchange timestamp")
+            try:
+                book_age_s = timer.wall() - int(book.timestamp) / 1000.0
+            except (TypeError, ValueError) as exc:
+                raise PaperRejected("public order book has an invalid timestamp") from exc
+            if book_age_s < -5.0 or book_age_s > self.max_book_age_s:
+                raise PaperRejected(f"public order book is stale (age={book_age_s:.3f}s)")
+            if not book.asks:
+                raise PaperRejected(
+                    f"cannot FOK buy {side}: no asks on the live book "
+                    "(liquidity pulled or one-sided)")
+            # A real executable spread requires both sides of the same,
+            # timestamped venue snapshot.
+            best_bid = book.best_bid
+            if best_bid is None:
+                raise PaperRejected("public order book has no bid; spread is unknown")
+            spread = book.asks[0][0] - best_bid
+            if spread > Decimal(str(self.max_spread)):
+                raise PaperRejected(
+                    f"spread {spread:.6f} exceeds paper limit {self.max_spread:.6f}")
+            # An order-level cap may tighten the account ceiling but never
+            # loosen it: a caller cannot buy above what the account allows.
+            cap = self.max_buy_price
+            if max_price is not None:
+                cap = min(cap, float(max_price))
+                if cap <= self.min_buy_price:
+                    raise PaperRejected(
+                        f"order price cap {cap} is at or below the floor "
+                        f"{self.min_buy_price}")
+            spend = size_to_venue_minimum(amount, book, rules, cap)
+            if spend > Decimal(str(amount)):
+                print(
+                    f"[PAPER] Sizing ${float(amount):.2f} up to ${float(spend):.2f} "
+                    f"to meet the venue minimum"
+                )
+            quote = estimate_fok(book, spend, cap, rules,
+                                 min_price=self.min_buy_price)
+            if timer.wall() >= end - self.min_seconds_to_expiry:
+                raise PaperRejected("paper quote reached the round cutoff")
+            with self._lock:
+                if self.cash_balance() + 1e-9 < float(quote.total_cost):
+                    raise PaperRejected(
+                        f"paper cash ${self.cash_balance():.6f} is below total cost "
+                        f"${quote.total_cost:.6f}")
+                guard_error = _pre_submit_guard_error(pre_submit_guard)
+                if guard_error is not None:
+                    raise PaperRejected(guard_error)
+                if timer.wall() >= end - self.min_seconds_to_expiry:
+                    raise PaperRejected("pre-submit guard reached the round cutoff")
+                order_id = f"paper-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+                inserted = self.ledger.record_fill_durable(
+                    order_id, str(token_id), shares=float(quote.shares),
+                    price=float(quote.average_price), side="BUY",
+                    condition_id=condition_id, status="CONFIRMED",
+                    source="paper_live_book", fee=float(quote.fee))
+                if not inserted:
+                    raise PaperRejected("paper fill id collision")
+                self.filled_orders += 1
+                self.last_error = None
+                self.last_fill = {
+                    "order_id": order_id,
+                    "status": "FILLED",
+                    "side": side,
+                    "token_id": str(token_id),
+                    "condition_id": condition_id,
+                    "requested_amount": float(quote.notional),
+                    "shares": float(quote.shares),
+                    "average_price": float(quote.average_price),
+                    "worst_price": float(quote.worst_price),
+                    "fee": float(quote.fee),
+                    "total_cost": float(quote.total_cost),
+                    "fee_rate": float(rules.fee_rate),
+                    "fee_exponent": rules.fee_exponent,
+                    "fee_source": rules.source,
+                    "book_timestamp": book.timestamp,
+                    "book_hash": book.book_hash,
+                    "book_age_ms": book_age_s * 1000.0,
+                    "assumed_latency_ms": assumed_latency_ms,
+                    "cash_after": self.cash_balance(),
+                    "levels": [[float(p), float(sh), float(n)]
+                               for p, sh, n in quote.levels],
+                    "wall": time.time(),
+                }
+                self._audit(self.last_fill)
+            self._publish_error(None)
+            print(
+                f"[PAPER] FOK filled: {side} ${float(quote.notional):.2f} | "
+                f"{float(quote.shares):.6f} shares @ {float(quote.average_price):.6f} | "
+                f"fee ${float(quote.fee):.5f} | cash ${self.cash_balance():.2f}")
+            if self.on_event:
+                self.on_event("paper", f"FILL {side} {float(quote.shares):.4f} @ "
+                              f"{float(quote.average_price):.4f}", "good")
+            return True
+        except PaperRejected as exc:
+            return self._reject(side, amount, str(exc))
+        except Exception as exc:
+            # Persistence/invariant failures are not ordinary FOK rejects.
+            # Let the exception stop the runner so it cannot continue from
+            # accounting state whose durability is uncertain.
+            self.last_error = f"paper engine fatal: {type(exc).__name__}: {exc}"
+            self._publish_error(self.last_error)
+            print(f"[PAPER] FATAL: {self.last_error}")
+            raise
+
+    def _reject(self, side, amount, reason: str) -> bool:
+        reason = reason or "paper order rejected"
+        with self._lock:
+            self.rejected_orders += 1
+            self.last_error = reason
+            self.last_fill = None
+            self._audit({
+                "status": "REJECTED", "side": side,
+                "requested_amount": amount, "reason": reason,
+                "wall": time.time(), "cash_after": self.cash_balance(),
+            })
+        self._publish_error(reason)
+        print(f"[PAPER] FOK rejected: {reason}")
+        if self.on_event:
+            self.on_event("paper", f"REJECT {reason}", "warn")
+        return False
+
+    @staticmethod
+    def _publish_error(reason: str | None) -> None:
+        # main_bot historically reads this module attribute after a failure.
+        # Updating it preserves that error display while the bound live order
+        # function itself remains replaced by PaperBroker.place_trade.
+        import polymarket_trade
+        polymarket_trade.last_order_error = reason
+
+    def _audit(self, row: dict) -> None:
+        try:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except Exception as exc:
+            raise RuntimeError(f"paper audit log could not be saved: {exc}") from exc
+
+    # --------------------------------------------------------- reporting
+    def summary(self, mark=None) -> dict:
+        ledger = self.ledger.summary(mark=mark)
+        cash = self.cash_balance()
+        unreal = ledger.get("unrealized_mark_to_bid")
+        if ledger.get("open_positions", 0) == 0:
+            equity = cash
+        elif unreal is None or ledger.get("unmarkable_positions", 0):
+            equity = None
+        else:
+            equity = cash + ledger["pending_cost"] + unreal
+        return {
+            "mode": "PAPER",
+            "starting_balance": self.start_balance,
+            "cash": cash,
+            "equity": equity,
+            "total_pnl": None if equity is None else equity - self.start_balance,
+            "filled_orders_session": self.filled_orders,
+            "rejected_orders_session": self.rejected_orders,
+            "ledger_path": str(Path(self.ledger.path).resolve()),
+            "audit_path": str(self.audit_path.resolve()),
+            **ledger,
+        }
+
+
+def install_paper_execution(main_bot, broker: PaperBroker, *, log_path=None) -> None:
+    """Bind the bot to paper execution and poison the live-client gateway."""
+    import polymarket_trade
+
+    # Defense in depth: even an overlooked direct live-function call cannot
+    # obtain a client, sign, cancel, query a wallet, or post an order.
+    def blocked_live_client(*_args, **_kwargs):
+        raise RuntimeError("live CLOB client is disabled by --paper")
+
+    polymarket_trade.disable_live_execution()
+    polymarket_trade._get_client = blocked_live_client
+    main_bot.execution_mode = "PAPER"
+    main_bot._paper_broker = broker
+    main_bot.get_balance_allowance = broker.get_balance_allowance
+    main_bot.cancel_all_open_orders = broker.cancel_all_open_orders
+    main_bot.place_trade = broker.place_trade
+    if log_path is not None:
+        main_bot.TRADE_LOG = Path(log_path)
