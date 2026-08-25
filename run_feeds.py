@@ -373,6 +373,40 @@ def _require_live_fill_coverage(*, paper: bool, user_ws: str) -> None:
         "live trading requires USER_WS=on; REST reconcile is backup-only")
 
 
+def _install_io_executor():
+    """Size the thread pool for I/O, not for CPU count.
+
+    ``asyncio.to_thread`` defaults to ``min(32, cpu_count + 4)`` workers, which
+    is sized for CPU-bound work. Every to_thread call here is a blocking
+    network read - book fetches, discovery, the liquidity probe, the modeled
+    fill, the settlement lookup - and there are two dozen such call sites.
+
+    On a 1-vCPU VPS that default is FIVE workers. The settlement poll can hold
+    one for seconds at a time while it walks the open conditions, and a single
+    trade cycle wants several at once for its legs. The pool saturates, further
+    to_thread calls queue behind it, and the bot stops making progress for a
+    while - which looks exactly like a freeze. A 16-core dev box gets 20
+    workers and never shows it.
+
+    Threads blocked on a socket cost almost nothing, so size by concurrent
+    reads instead. Returns the executor so the caller can shut it down.
+    """
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        loop = asyncio.get_running_loop()
+        workers = max(32, (os.cpu_count() or 1) + 4)
+        executor = ThreadPoolExecutor(max_workers=workers,
+                                      thread_name_prefix="btcbot-io")
+        loop.set_default_executor(executor)
+        on_event("startup", f"io thread pool sized to {workers} workers "
+                            f"({os.cpu_count() or 1} cpu)", "info")
+        return executor
+    except Exception as exc:
+        # Never block startup over a tuning knob; the default pool still works.
+        on_event("startup", f"could not resize io pool: {type(exc).__name__}", "warn")
+        return None
+
+
 async def run(dash: bool = False, *, paper: bool = True,
               paper_balance: float | None = None) -> None:
     root = Path(__file__).resolve().parent
@@ -383,10 +417,13 @@ async def run(dash: bool = False, *, paper: bool = True,
         lock_path = root / lock_path
     process_lock = _ProcessLock(lock_path)
     process_lock.acquire()
+    executor = _install_io_executor()
     try:
         await _run_inner(dash=dash, paper=paper, paper_balance=paper_balance)
     finally:
         process_lock.release()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 async def _run_inner(dash: bool = False, *, paper: bool = True,

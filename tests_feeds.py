@@ -1445,6 +1445,24 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
+    # Re-approved 2026-08-25: connection pooling, per-signal legs, and two
+    # ordering fixes found while auditing them.
+    #   orderbook.py, market_discovery.py - venue reads go through the pooled
+    #     http_pool session. Every call used to rebuild its TCP+TLS connection:
+    #     415ms unpooled vs 95ms pooled, and one more chance to fail per call.
+    #   config.py - PHASE2_MULTI_SIGNAL, PHASE2_PARTIAL_SIGNALS, PAIR_LOCK_*,
+    #     ROUND_PREPARE_LEAD_SECONDS, ROUND_POLL_SECONDS.
+    #   main_bot.py - SIG BOOK and SIG CHAINLINK trade their own legs; a
+    #     missing Chainlink strike no longer cancels a round SIG PRICE could
+    #     have traded; the pair-lock permits a complement leg only when both
+    #     entries plus both fees stay under $1.00.
+    #   main_bot.py - the exposure cap is re-checked immediately before the
+    #     price leg submits. The multi-signal legs spend against the same round
+    #     budget after the first check, so the round could exceed
+    #     MAX_ROUND_EXPOSURE by up to two entries ($9.63 on a $98.44 cap).
+    #   main_bot.py - the multi-signal legs' elapsed time is excluded from the
+    #     price leg's validation window. Two legs cost ~1.25s of a 3s budget,
+    #     and that work is done for other signals.
     # Re-approved 2026-08-17: a fourth phase-1 band (T-120..T-60, 0.55-0.75,
     # 8s cadence) replaces phase 2's signal path, which is now off by default.
     # Bands may carry their own cadence as an optional 5th field, and a band
@@ -1495,7 +1513,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "b56f3ff8fcd79ca553f9bbc0ac192bab58a710b49c648a8d685e67856b927b90",
+    "config.py": "eed930a1b1b2efc414ff47e3f94579e3c7bc33e01af9c8a06345b599b823820c",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -1504,11 +1522,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-25: PAPER may acquire the complementary outcome only
     # after a fresh, round-local SIG PRICE epoch; LIVE and ambiguous restarts
     # remain blocked, and executor commit still rechecks the selected side.
-    "main_bot.py": "31d05139f1b6395f20861be76cade3c97d9e9d40a993a2986108a90d5fe95e38",
+    "main_bot.py": "02225c9e6460e2ed73f3daf0a42318a1b05cb0ff0d627e572d5fb90b1887fdbc",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
-    "market_discovery.py": "39af0db02b1aa48f684d06f293e2b1f0f24a9795a23a3f0e6a8f24d76e60bf42",
-    "orderbook.py": "38e4c3758538d77d1ed32b6cfc8c3ea202fed1ca7f46fc9d2ae6ebb656af5227",
+    "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
+    "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
     "polymarket_trade.py": "c48265480c7a3bbd5c30acd23f729203900b1b1565ae0cdfd3ae4983c4d74c97",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
