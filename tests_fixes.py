@@ -277,8 +277,14 @@ def t_mid_window_reconnect_never_invents_a_boundary_strike():
 
 def t_round_state_cannot_reuse_a_previous_strike():
     source = pathlib.Path("main_bot.py").read_text(encoding="utf-8")
+    # Both must be cleared at the transition, but they need not be adjacent -
+    # a per-round one-shot flag legitimately sits between them. Match the
+    # block rather than the exact two lines, so adding such a flag is not a
+    # false failure on an invariant that still holds.
+    _transition = source.split("active_window = round_window", 1)[-1][:600]
     check("round transition explicitly clears both start prices",
-          "start_price = None\n            start_chainlink_price = None" in source)
+          "start_price = None" in _transition
+          and "start_chainlink_price = None" in _transition)
     check("Binance strike is latched from the exchange timestamp",
           "active_window * 1000 <= ts_ms < (active_window + 5) * 1000" in source)
     check("stale last-known opening fallback was removed entirely",
