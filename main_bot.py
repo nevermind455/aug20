@@ -9,6 +9,7 @@ from pathlib import Path
 
 import config
 import market_discovery
+import http_pool
 import orderbook
 import price_ws
 import strategy
@@ -77,6 +78,48 @@ def current_chainlink_twap():
     except Exception as exc:
         _record_strike_read_error(exc)
         return None
+
+
+BINANCE_AGG_TRADES = "https://api.binance.com/api/v3/aggTrades"
+
+
+def _recover_boundary_print(window_start: int, timeout: float = 6.0):
+    """Fetch the round's opening print that the websocket failed to latch.
+
+    The latch needs a trade stamped inside the first 5 seconds of the round.
+    If the socket is mid-reconnect across the boundary that trade is never
+    delivered, and the whole round is skipped - measured at roughly one round
+    in five.
+
+    This is recovery, not substitution: aggTrades is queried for the SAME
+    [window, window+5) interval, so the value returned is the one the socket
+    would have latched, not a later price standing in for it. A response whose
+    timestamp falls outside that interval is refused, because a trade from
+    later in the round answers a different question - the market asks whether
+    the close beats the OPEN.
+    """
+    try:
+        response = http_pool.get(
+            BINANCE_AGG_TRADES,
+            params={"symbol": config.SYMBOL, "startTime": int(window_start) * 1000,
+                    "endTime": (int(window_start) + 5) * 1000, "limit": 1},
+            timeout=timeout)
+        response.raise_for_status()
+        rows = response.json()
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    try:
+        stamped = int(rows[0]["T"])
+        price = float(rows[0]["p"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (int(window_start) * 1000 <= stamped < (int(window_start) + 5) * 1000):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
 
 
 def price_signal(round_key: int, start_price, current_price):
@@ -399,6 +442,7 @@ def _kill_switch():
 
 async def run_bot():
     start_price = None
+    boundary_backfilled = False
     start_chainlink_price = None
     active_window = None
     round_exposure = 0.0
@@ -491,6 +535,7 @@ async def run_bot():
             # old loop only overwrote these when a feed read succeeded.
             active_window = round_window
             start_price = None
+            boundary_backfilled = False
             start_chainlink_price = None
             # The on-screen trade log is a per-round view. Rows from the round
             # that just closed would read as activity in this market, so the
@@ -546,6 +591,19 @@ async def run_bot():
                         f"(Binance start_price=${start_price:,.2f})"
                     )
                     break
+            if (start_price is None and not boundary_backfilled
+                    and exact_remaining <= 300 - config.BOUNDARY_BACKFILL_AFTER):
+                # The socket has had its chance; ask REST for the same trade.
+                boundary_backfilled = True
+                recovered = await asyncio.to_thread(
+                    _recover_boundary_print, active_window)
+                if recovered is not None:
+                    start_price = recovered
+                    print(f"{_ts()} [ROUND] Opening print recovered from REST "
+                          f"(Binance start_price=${start_price:,.2f})")
+                else:
+                    print(f"{_ts()} [ROUND] Opening print could not be recovered; "
+                          f"this round has no Binance reference.")
 
         now = asyncio.get_running_loop().time()
         if now - last_status >= 30:

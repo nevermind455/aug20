@@ -229,6 +229,17 @@ if (not math.isfinite(ASSUMED_MATCH_DELAY_SECONDS)
         or not 0 <= ASSUMED_MATCH_DELAY_SECONDS <= 120):
     raise ValueError("ASSUMED_MATCH_DELAY_SECONDS must be between 0 and 120")
 
+# The opening print is latched from a websocket trade stamped in the first 5
+# seconds of the round. A socket mid-reconnect across the boundary never
+# receives it and the whole round is lost - measured at about one round in
+# five. After this many seconds the bot asks Binance REST for a trade from the
+# SAME 5-second interval, which recovers the identical value rather than
+# substituting a later price. Give the socket a real chance first; retrying too
+# early just spends an API call on a print that was about to arrive.
+BOUNDARY_BACKFILL_AFTER = _env_float("BOUNDARY_BACKFILL_AFTER", "15")
+if not math.isfinite(BOUNDARY_BACKFILL_AFTER) or not 5 <= BOUNDARY_BACKFILL_AFTER <= 120:
+    raise ValueError("BOUNDARY_BACKFILL_AFTER must be between 5 and 120 seconds")
+
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
