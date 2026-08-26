@@ -1373,6 +1373,11 @@ async def run_bot():
                 hint = ""
                 if reason and "not enough balance" in reason.lower():
                     hint = " - Deposit USDC on Polygon and enable trading at polymarket.com"
+                elif reason and "future-dated" in reason.lower():
+                    hint = (
+                        " - Local clock is behind the CLOB; sync Windows Time "
+                        "(start the service, then `w32tm /resync`) and restart"
+                    )
                 print(f"{_ts()} [BOT] Order was NOT placed - reason: {reason}{hint}")
 
             _append_trade(

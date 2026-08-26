@@ -252,6 +252,88 @@ def t_paper_ws_book_without_exchange_ts_falls_back_to_rest():
           preferred.timestamp == rest.timestamp, str(preferred.timestamp))
 
 
+def t_paper_quiet_book_is_not_mistaken_for_a_stale_one():
+    """Paper FOK must use the same held/quiet split as the live book parser.
+
+    The previous check treated exchange-timestamp age as copy freshness, so a
+    book the venue had not changed for more than 8s was refused even though
+    REST had just returned it. On btc-updown-5m, 33s+ gaps between changes
+    are ordinary.
+    """
+    from dataclasses import replace
+
+    import timer
+
+    feeds = pathlib.Path(__file__).with_name("run_feeds.py").read_text(encoding="utf-8")
+    check("runner wires the quiet bound into paper",
+          "max_quiet_s=config.ORDERBOOK_MAX_QUIET_SECONDS" in feeds)
+    check("runner wires the future-dated bound into paper",
+          "future_tol_s=config.ORDERBOOK_FUTURE_TOLERANCE_SECONDS" in feeds)
+
+    now = timer.wall()
+
+    def snap(*, quiet_s=1.0, held_s=0.05):
+        return replace(
+            book(),
+            timestamp=str(int((now - quiet_s) * 1000)),
+            received_wall=now - held_s,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap(quiet_s=95.0))
+        check("a book unchanged for 95s still fills",
+              paper_order(broker) is True, broker.last_error)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap(held_s=40.0))
+        check("a copy held 40s is refused",
+              paper_order(broker) is False, broker.last_error)
+        check("held refusal names the copy, not quiet time",
+              "stale in hand" in (broker.last_error or ""), broker.last_error)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap(quiet_s=1200.0))
+        check("a book unchanged past the frozen-venue bound is refused",
+              paper_order(broker) is False, broker.last_error)
+        check("the frozen-venue refusal names the cause",
+              "not changed" in (broker.last_error or ""), broker.last_error)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap(quiet_s=-30.0))
+        check("a book dated well ahead of us is refused",
+              paper_order(broker) is False, broker.last_error)
+        check("the future refusal names the clock",
+              "future-dated" in (broker.last_error or ""), broker.last_error)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap(quiet_s=-2.0))
+        check("a book inside the future tolerance still fills",
+              paper_order(broker) is True, broker.last_error)
+
+
+def t_paper_ws_held_age_uses_socket_receipt_not_conversion_time():
+    """Stamping ``now`` at conversion would hide an already-old LIVE book."""
+    import timer
+
+    now_ms = int(timer.wall() * 1000)
+    view = types.SimpleNamespace(
+        token="up", status="LIVE", asks=((0.55, 80.0),),
+        best_bid=0.54, exchange_ts_ms=now_ms - 95_000,
+        tick_size=0.01, hash="ws-quiet",
+        updated_mono=time.monotonic() - 40.0,
+    )
+    snap = snapshot_from_book_view(view, expected_token="up")
+    held = timer.wall() - snap.received_wall
+    check("socket receipt age is preserved on the snapshot",
+          39.0 <= held <= 41.0, str(held))
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=snap)
+        check("an old socket copy is refused as stale in hand",
+              paper_order(broker) is False, broker.last_error)
+        check("the refusal is held-age, not quiet-age",
+              "stale in hand" in (broker.last_error or ""), broker.last_error)
+
+
 def t_dynamic_v2_fee_curve_and_missing_fee_rejection():
     metadata = {
         "condition_id": "cond", "seconds_delay": 0,
@@ -516,6 +598,7 @@ def t_execution_window_covers_every_enabled_phase():
           str(config.EXECUTION_WINDOW_SECONDS))
 
     import timer as timer_mod
+    from dataclasses import replace
 
     with tempfile.TemporaryDirectory() as tmp:
         broker = _broker(tmp)
@@ -525,14 +608,24 @@ def t_execution_window_covers_every_enabled_phase():
         original = timer_mod.wall
         # Stand at the top of the round, where phase 1 trades and phase 2
         # has not opened yet.
-        timer_mod.wall = lambda *_a, **_k: end - 290.0
+        sampled = end - 290.0
+        timer_mod.wall = lambda *_a, **_k: sampled
         try:
-            paper_order(broker, amount=2.5, end=end)
+            # Freshness is measured against timer.wall(), so a book stamped
+            # with real time.time() looks ~5 minutes in the future here.
+            broker._book_fetch = lambda token: replace(
+                book(),
+                timestamp=str(int(sampled * 1000)),
+                received_wall=sampled,
+            )
+            accepted = paper_order(broker, amount=2.5, end=end)
         finally:
             timer_mod.wall = original
         check("a phase-1 timestamp is not refused as out-of-interval",
               "outside the current round execution interval"
               not in (broker.last_error or ""), str(broker.last_error))
+        check("a phase-1 order fills against a contemporaneous book",
+              accepted is True, broker.last_error)
 
         # And the guard still bites outside every phase.
         timer_mod.wall = lambda *_a, **_k: end - 900.0

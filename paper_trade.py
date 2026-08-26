@@ -127,7 +127,8 @@ def _decimal(value, *, name: str) -> Decimal:
     return out
 
 
-def parse_book(data: dict, expected_token: str) -> BookSnapshot:
+def parse_book(data: dict, expected_token: str, *,
+               received_wall: float | None = None) -> BookSnapshot:
     """Validate and normalise one public ``GET /book`` response."""
     if not isinstance(data, dict):
         raise PaperRejected("public order book returned a non-object")
@@ -193,8 +194,36 @@ def parse_book(data: dict, expected_token: str) -> BookSnapshot:
         tick_size=optional_decimal("tick_size", "minimum_tick_size"),
         timestamp=str(timestamp_ms),
         book_hash=str(data.get("hash")) if data.get("hash") is not None else None,
-        received_wall=timer.wall(),
+        received_wall=_receipt_wall(received_wall),
     )
+
+
+def _receipt_wall(received_wall: float | None = None, *,
+                  updated_mono: float | None = None) -> float:
+    """Wall time when this copy of the book arrived in our hands.
+
+    For a websocket view, convert monotonic receipt age onto CLOB-aligned
+    wall time so the later held-age check measures the same interval as
+    ``BookView.book_age_ms``. Stamping ``now`` here would make a quiet but
+    already-old socket book look freshly fetched.
+    """
+    if received_wall is not None:
+        try:
+            stamp = float(received_wall)
+        except (TypeError, ValueError) as exc:
+            raise PaperRejected("public order book has an invalid receipt time") from exc
+        if not math.isfinite(stamp) or stamp <= 0:
+            raise PaperRejected("public order book has an invalid receipt time")
+        return stamp
+    if updated_mono is not None:
+        try:
+            age_s = time.monotonic() - float(updated_mono)
+        except (TypeError, ValueError) as exc:
+            raise PaperRejected("websocket order book has an invalid receipt time") from exc
+        if not math.isfinite(age_s) or age_s < 0 or age_s >= 86_400:
+            raise PaperRejected("websocket order book has an invalid receipt time")
+        return timer.wall() - age_s
+    return timer.wall()
 
 
 def fetch_public_book(token_id: str, *, host: str, timeout: float = 8.0) -> BookSnapshot:
@@ -202,8 +231,11 @@ def fetch_public_book(token_id: str, *, host: str, timeout: float = 8.0) -> Book
     _require_https_origin(host)
     response = http_pool.get(f"{host.rstrip('/')}/book",
                              params={"token_id": str(token_id)}, timeout=timeout)
+    # Stamp arrival before parsing so held-age is the copy we hold, not
+    # however long decoding took. Same split as orderbook.get_orderbook.
+    received_wall = timer.wall()
     response.raise_for_status()
-    return parse_book(response.json(), str(token_id))
+    return parse_book(response.json(), str(token_id), received_wall=received_wall)
 
 
 def snapshot_from_book_view(view, *, expected_token: str | None = None) -> BookSnapshot:
@@ -251,7 +283,8 @@ def snapshot_from_book_view(view, *, expected_token: str | None = None) -> BookS
         tick_size=tick,
         timestamp=str(int(ts)),
         book_hash=str(digest) if digest else None,
-        received_wall=timer.wall(),
+        received_wall=_receipt_wall(
+            updated_mono=getattr(view, "updated_mono", None)),
     )
 
 
@@ -485,6 +518,8 @@ class PaperBroker:
         category: str = "crypto",
         latency_ms: float = 0.0,
         max_book_age_s: float = 8.0,
+        max_quiet_s: float = 900.0,
+        future_tol_s: float = 5.0,
         max_spread: float = 0.25,
         min_seconds_to_expiry: float = 1.0,
         trade_window_seconds: float = 60.0,
@@ -498,10 +533,14 @@ class PaperBroker:
         self.category = category
         self.latency_ms = float(latency_ms)
         self.max_book_age_s = float(max_book_age_s)
+        self.max_quiet_s = float(max_quiet_s)
+        self.future_tol_s = float(future_tol_s)
         self.max_spread = float(max_spread)
         self.min_seconds_to_expiry = float(min_seconds_to_expiry)
         self.trade_window_seconds = float(trade_window_seconds)
         if (not 0 <= self.latency_ms < 60_000 or self.max_book_age_s <= 0
+                or self.max_quiet_s <= 0
+                or not 0 <= self.future_tol_s < 86_400
                 or not 0 < self.max_spread <= 1
                 or not 0 <= self.min_seconds_to_expiry < 300
                 or not self.min_seconds_to_expiry < self.trade_window_seconds <= 300
@@ -804,12 +843,30 @@ class PaperBroker:
                 raise PaperRejected("invalid public order book response")
             if book.timestamp is None:
                 raise PaperRejected("public order book omitted exchange timestamp")
+            if not math.isfinite(book.received_wall) or book.received_wall <= 0:
+                raise PaperRejected("public order book omitted receipt time")
             try:
-                book_age_s = timer.wall() - int(book.timestamp) / 1000.0
-            except (TypeError, ValueError) as exc:
+                book_ts_s, _unit = timer.parse_exchange_ts(book.timestamp)
+            except ValueError as exc:
                 raise PaperRejected("public order book has an invalid timestamp") from exc
-            if book_age_s < -5.0 or book_age_s > self.max_book_age_s:
-                raise PaperRejected(f"public order book is stale (age={book_age_s:.3f}s)")
+            now_wall = timer.wall()
+            # Quiet = how long since the venue last changed the book.
+            # Held = how long this copy has been in our hands. The live
+            # orderbook parser already splits these; conflating them with
+            # ORDERBOOK_MAX_AGE_SECONDS (8s) refused ordinary quiet
+            # btc-updown-5m books (33s+ between changes) as "stale".
+            quiet_s = now_wall - book_ts_s
+            held_s = now_wall - book.received_wall
+            book_age_s = quiet_s
+            if quiet_s < -self.future_tol_s:
+                raise PaperRejected(
+                    f"public order book is future-dated (age={quiet_s:.3f}s)")
+            if held_s > self.max_book_age_s:
+                raise PaperRejected(
+                    f"public order book is stale in hand (held={held_s:.3f}s)")
+            if quiet_s > self.max_quiet_s:
+                raise PaperRejected(
+                    f"public order book has not changed for {quiet_s:.3f}s")
             if not book.asks:
                 raise PaperRejected(
                     f"cannot FOK buy {side}: no asks on the live book "
@@ -880,6 +937,7 @@ class PaperBroker:
                     "book_timestamp": book.timestamp,
                     "book_hash": book.book_hash,
                     "book_age_ms": book_age_s * 1000.0,
+                    "book_held_ms": held_s * 1000.0,
                     "assumed_latency_ms": assumed_latency_ms,
                     "cash_after": self.cash_balance(),
                     "levels": [[float(p), float(sh), float(n)]

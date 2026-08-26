@@ -513,6 +513,8 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             category=os.environ.get("MARKET_CATEGORY", "crypto"),
             latency_ms=config.PAPER_LATENCY_MS,
             max_book_age_s=config.ORDERBOOK_MAX_AGE_SECONDS,
+            max_quiet_s=config.ORDERBOOK_MAX_QUIET_SECONDS,
+            future_tol_s=config.ORDERBOOK_FUTURE_TOLERANCE_SECONDS,
             max_spread=config.MAX_ALLOWED_SPREAD,
             min_seconds_to_expiry=config.MIN_SECONDS_TO_EXPIRY,
             # Must span every enabled phase, not just phase 2's window.
