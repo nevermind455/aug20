@@ -1,5 +1,6 @@
 """Validated public CLOB order-book reads used by the decision path."""
 import math
+import os
 import time
 from decimal import Decimal, InvalidOperation
 
@@ -10,6 +11,11 @@ import http_pool
 import timer
 
 BOOK_URL = "https://clob.polymarket.com/book"
+
+# Opt-in per-read timestamp logging. Off by default so a healthy run
+# stays quiet; set ORDERBOOK_TS_LOG=1 to see every accepted book.
+_TS_LOG = (os.environ.get("ORDERBOOK_TS_LOG", "") or "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 def _number(name, value, *, minimum=None, maximum=None, inclusive_min=False):
@@ -57,29 +63,109 @@ def _levels(raw_levels, side):
     ]
 
 
-def parse_orderbook(data, token_id, *, max_age_s=None, now=None):
+# The last completed freshness decision, kept so a caller or the dashboard can
+# show why a book was taken or refused without re-deriving it.
+LAST_TIMESTAMP_REPORT: dict | None = None
+
+
+def _format_report(r: dict) -> str:
+    return (f"exchange_ts={r['exchange_ts_raw']!r} ({r['unit']}, "
+            f"{r['exchange_ts_s']:.3f}s) "
+            f"local_ts={r['local_ts_s']:.3f}s "
+            f"clock_offset={r['clock_offset_s']:+.3f}s "
+            f"quiet={r['quiet_s']:.3f}s (max {r['max_quiet_s']:.1f}s) "
+            f"held={r['held_s']:.3f}s (max {r['max_age_s']:.1f}s) "
+            f"future_tolerance={r['future_tol_s']:.1f}s "
+            f"source={r['source']}")
+
+
+def _timestamp_report(data, *, now, received_at, max_age_s, max_quiet_s,
+                      future_tol_s, source):
+    """Everything the freshness decision rests on, in one place.
+
+    Two independent quantities, which the old check conflated into one:
+
+      quiet - how long since the VENUE last changed the book. On a quiet
+              market this grows without bound and says nothing about whether
+              our copy is current.
+      held  - how long since WE received this response. This is the real
+              staleness of the data in our hands.
+    """
+    raw = data.get("timestamp")
+    try:
+        ts_s, unit = timer.parse_exchange_ts(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"CLOB book has no valid exchange timestamp: {exc} "
+            f"(got {raw!r}, local_ts={now:.3f}s)") from exc
+    return {
+        "exchange_ts_raw": raw,
+        "exchange_ts_s": ts_s,
+        "unit": unit,
+        "local_ts_s": now,
+        "clock_offset_s": timer.clock_offset(),
+        "received_at_s": received_at,
+        "quiet_s": now - ts_s,
+        "held_s": now - received_at,
+        "max_age_s": max_age_s,
+        "max_quiet_s": max_quiet_s,
+        "future_tol_s": future_tol_s,
+        "source": source,
+    }
+
+
+def parse_orderbook(data, token_id, *, max_age_s=None, now=None,
+                    received_at=None, max_quiet_s=None, future_tol_s=None,
+                    source="clob-rest"):
+    global LAST_TIMESTAMP_REPORT
     if not isinstance(data, dict):
         raise ValueError("CLOB book response is not an object")
     expected = str(token_id)
     asset = data.get("asset_id")
     if asset is None or str(asset) != expected:
         raise ValueError("CLOB book asset_id does not match the requested token")
-    try:
-        ts_ms = int(data["timestamp"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("CLOB book has no valid exchange timestamp") from exc
-    if ts_ms <= 0:
-        raise ValueError("CLOB book has a non-positive exchange timestamp")
     wall = timer.wall() if now is None else _number(
         "now", now, minimum=0, inclusive_min=True)
-    age = wall - ts_ms / 1000.0
     limit = _number(
         "max_age_s",
         config.ORDERBOOK_MAX_AGE_SECONDS if max_age_s is None else max_age_s,
         minimum=0,
     )
-    if age < -5.0 or age > limit:
-        raise ValueError(f"CLOB book is stale or future-dated (age={age:.3f}s)")
+    quiet_limit = _number(
+        "max_quiet_s",
+        config.ORDERBOOK_MAX_QUIET_SECONDS if max_quiet_s is None else max_quiet_s,
+        minimum=0,
+    )
+    future_tol = _number(
+        "future_tol_s",
+        (config.ORDERBOOK_FUTURE_TOLERANCE_SECONDS
+         if future_tol_s is None else future_tol_s),
+        minimum=0, inclusive_min=True,
+    )
+    held_at = wall if received_at is None else _number(
+        "received_at", received_at, minimum=0, inclusive_min=True)
+    report = _timestamp_report(
+        data, now=wall, received_at=held_at, max_age_s=limit,
+        max_quiet_s=quiet_limit, future_tol_s=future_tol, source=source)
+    LAST_TIMESTAMP_REPORT = report
+
+    # A book dated ahead of us is a clock or unit fault, never a real book.
+    if report["quiet_s"] < -future_tol:
+        raise ValueError(
+            "CLOB book is future-dated - check the clock and the timestamp "
+            f"unit: {_format_report(report)}")
+    # Held time is the freshness of the copy we are about to trade on.
+    if report["held_s"] > limit:
+        raise ValueError(
+            f"CLOB book response is stale in hand: {_format_report(report)}")
+    # Quiet time only catches a venue serving a frozen or cached book. It is
+    # deliberately generous: an unchanged book is still the current book.
+    if report["quiet_s"] > quiet_limit:
+        raise ValueError(
+            "CLOB book has not changed for longer than the venue-frozen "
+            f"bound: {_format_report(report)}")
+    if _TS_LOG:
+        print(f"[BOOK-TS] accepted {_format_report(report)}", flush=True)
 
     bids = _levels(data.get("bids"), "bid")
     asks = _levels(data.get("asks"), "ask")
@@ -99,11 +185,14 @@ def get_orderbook(token_id, timeout=8.0):
     for attempt in range(2):
         try:
             resp = http_pool.get(BOOK_URL, params={"token_id": token}, timeout=timeout)
+            # Stamp arrival before any parsing, so `held` measures the age of
+            # the data we hold rather than however long decoding took.
+            received_at = timer.wall()
             status = int(getattr(resp, "status_code", 200) or 0)
             if status == 429 or 500 <= status <= 599:
                 resp.raise_for_status()
             resp.raise_for_status()
-            return parse_orderbook(resp.json(), token)
+            return parse_orderbook(resp.json(), token, received_at=received_at)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
         except requests.HTTPError as exc:

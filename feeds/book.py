@@ -22,6 +22,7 @@ import time
 import math
 from dataclasses import dataclass
 
+import config
 import timer
 from .health import DISCONNECTED, LIVE, STALE, UNSYNCED
 
@@ -94,6 +95,12 @@ class BookState:
     def __init__(self, stale_after: float = 8.0) -> None:
         self._lock = threading.RLock()
         self.stale_after = stale_after
+        # Event-time sanity bounds. Separate from `stale_after`, which
+        # governs liveness measured from receipt.
+        self.future_tolerance = float(
+            getattr(config, 'ORDERBOOK_FUTURE_TOLERANCE_SECONDS', 5.0))
+        self.max_quiet = float(
+            getattr(config, 'ORDERBOOK_MAX_QUIET_SECONDS', 900.0))
         self._bids: dict[str, dict[float, float]] = {}
         self._asks: dict[str, dict[float, float]] = {}
         self._meta: dict[str, dict] = {}
@@ -383,10 +390,26 @@ class BookState:
                     if not self._meta.get(t, {}).get("synced")]
 
     def _fresh_exchange_ts(self, ts_ms: int | None) -> bool:
+        """Sanity-check an event timestamp. Liveness is NOT measured here.
+
+        The arrival of this message is what makes it current; the timestamp
+        says when the venue last changed the book, which on a quiet market is
+        far older. Bounding it by ``stale_after`` refused the resubscribe
+        snapshot of any book that had not traded in the last few seconds, and
+        the token then never synced at all. Liveness is measured from receipt
+        in ``status()``, against the same ``stale_after``.
+
+        What is still refused: a timestamp we cannot read, one dated ahead of
+        our clock (a clock or unit fault), and one so old the venue must be
+        serving a frozen book.
+        """
         if ts_ms is None:
             return False
-        age_s = timer.exchange_age_s(ts_ms)
-        return -5.0 <= age_s <= self.stale_after
+        try:
+            age_s = timer.exchange_age_s(ts_ms)
+        except ValueError:
+            return False
+        return -self.future_tolerance <= age_s <= self.max_quiet
 
 
 def _to_map(levels) -> tuple[dict[float, float], bool]:

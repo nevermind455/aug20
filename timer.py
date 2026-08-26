@@ -1,4 +1,5 @@
 import threading
+import math
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -42,9 +43,48 @@ def wall(ts: float | None = None) -> float:
     return time.time() - offset
 
 
+# Epoch timestamps land in disjoint magnitude bands, so the unit can be read
+# off the value itself instead of trusted. A venue that switched from
+# milliseconds to microseconds would otherwise put every book ~50000 years in
+# the future and every read would be refused as "future-dated".
+_TS_UNITS = ((1e11, 1.0, "s"),
+             (1e14, 1e3, "ms"),
+             (1e17, 1e6, "us"),
+             (1e20, 1e9, "ns"))
+
+
+def parse_exchange_ts(value) -> tuple[float, str]:
+    """Return (unix_seconds, unit) for an exchange timestamp of any unit.
+
+    Accepts seconds, milliseconds, microseconds or nanoseconds and reports
+    which it detected, so a rejection can say what it actually read.
+    """
+    try:
+        raw = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("exchange timestamp is not numeric") from exc
+    if not math.isfinite(raw):
+        raise ValueError("exchange timestamp is not finite")
+    if raw <= 0:
+        raise ValueError("exchange timestamp is not positive")
+    for ceiling, divisor, unit in _TS_UNITS:
+        if raw < ceiling:
+            return raw / divisor, unit
+    raise ValueError("exchange timestamp is implausibly large")
+
+
+def clock_offset() -> float:
+    """Current local-minus-venue correction applied by ``wall()``."""
+    with _clock_lock:
+        return _clock_offset
+
+
 def exchange_age_s(ts_ms: int | float) -> float:
-    """Age of an exchange timestamp versus CLOB-aligned wall time."""
-    return wall() - float(ts_ms) / 1000.0
+    """Age of an exchange timestamp versus CLOB-aligned wall time.
+
+    The argument name is historical; any unit is accepted and detected.
+    """
+    return wall() - parse_exchange_ts(ts_ms)[0]
 
 
 def now_et(ts: float | None = None):

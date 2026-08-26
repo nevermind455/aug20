@@ -1445,6 +1445,17 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
+    # Re-approved 2026-08-26: CLOB book freshness was measured from the
+    # venue's last-CHANGE timestamp, so a quiet market was refused as
+    # "stale or future-dated". Measured live: the venue held a full
+    # 0.5/0.51 book unchanged for 95s while answering in under 400ms,
+    # and every read in that window was thrown away. Staleness now
+    # comes from when the response was received; the last-change age
+    # only bounds a frozen venue (ORDERBOOK_MAX_QUIET_SECONDS, 900s).
+    # Timestamps are unit-detected (s/ms/us/ns) instead of assumed to
+    # be milliseconds, and the future bound is now a named knob that
+    # must not sit below CLOCK_MAX_DRIFT_SECONDS. Same fix applied to
+    # the websocket event-time gate, which had blocked initial sync.
     # Re-approved 2026-08-25: ASSUMED_MATCH_DELAY_SECONDS. The venue sets
     #   itode=true (a taker matching delay exists) without stating its
     #   duration, so the live path refused every order. It now refuses only
@@ -1518,7 +1529,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "9e5f506a7b9fecfa0855cb82ba1b82b9e2a3dd3e4f8880805fd5170dec0d7365",
+    "config.py": "ac900497319827be840080c8b02c07963d0bc000d867eed06c1e362bf88c436f",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -1531,7 +1542,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
-    "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
+    "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
     # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
     # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
     # still waits for a CONFIRMED user-channel trade; omitted amounts are not
@@ -1544,7 +1555,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "polymarket_trade.py": "e565627b336aaeb0ae9ae0b24bed2d2148ba83310ea27b8834b7938d6b33a007",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
-    "timer.py": "55cdaf1655b210c83791730b094e79d5c0b00a7e79b6a6ca2bd2950df21e3124",
+    "timer.py": "cc99bc40b0851153d4bbcc64c48a3c740df35c157fbe0b232107ff026e404967",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

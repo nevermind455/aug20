@@ -1733,6 +1733,126 @@ def t_signal_journal_measures_edge_against_the_price():
           empty["book"] is None and empty["binance"] is None, str(empty))
 
 
+def t_orderbook_quiet_book_is_not_mistaken_for_a_stale_one():
+    """A book the venue has not changed recently is still the current book.
+
+    Measured against btc-updown-5m: the venue left a full 0.5/0.51 book
+    untouched for 95 seconds while answering every request in under 400ms.
+    The old check measured staleness from the last CHANGE, so every one of
+    those reads was refused as "stale or future-dated" and the round traded
+    blind.
+    """
+    import orderbook
+    import timer
+
+    now = timer.wall()
+
+    def book(ts_s, unit_div=1000, asset="1"):
+        return {"asset_id": asset, "timestamp": str(int(ts_s * unit_div)),
+                "bids": [{"price": "0.50", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}]}
+
+    def accepted(**kw):
+        kw.setdefault("now", now)
+        try:
+            orderbook.parse_orderbook(kw.pop("data"), "1", **kw)
+            return True, ""
+        except ValueError as exc:
+            return False, str(exc)
+
+    for quiet in (33.0, 95.0, 300.0, 840.0):
+        ok, why = accepted(data=book(now - quiet))
+        check(f"a book unchanged for {quiet:.0f}s is accepted", ok, why)
+
+    ok, why = accepted(data=book(now - 1200.0))
+    check("a book unchanged past the frozen-venue bound is refused", not ok)
+    check("the frozen-venue refusal names the cause",
+          "not changed" in why, why)
+
+    # Freshness of the copy we hold is what actually matters.
+    ok, why = accepted(data=book(now - 1.0), received_at=now - 40.0)
+    check("a response held longer than the age limit is refused", not ok)
+    check("the held refusal is distinct from the quiet one",
+          "stale in hand" in why, why)
+
+    # Unit detection: the same instant expressed four ways must agree.
+    for div, unit in ((1, "s"), (1000, "ms"), (10**6, "us"), (10**9, "ns")):
+        ok, why = accepted(data=book(now - 2.0, unit_div=div))
+        check(f"a timestamp in {unit} is read at the right scale", ok, why)
+        if ok:
+            check(f"{unit} is reported as the detected unit",
+                  orderbook.LAST_TIMESTAMP_REPORT["unit"] == unit,
+                  str(orderbook.LAST_TIMESTAMP_REPORT["unit"]))
+
+    # Future-dating is a clock or unit fault, never a real book.
+    ok, _ = accepted(data=book(now + 2.0))
+    check("a book inside the future tolerance is accepted", ok)
+    ok, why = accepted(data=book(now + 30.0))
+    check("a book dated well ahead of us is refused", not ok)
+    check("the future refusal points at the clock and the unit",
+          "future-dated" in why and "unit" in why, why)
+
+    # Safety validation must not be reachable around.
+    for label, kw in (("now", {"now": float("nan")}),
+                      ("max_age_s", {"max_age_s": float("nan")}),
+                      ("max_quiet_s", {"max_quiet_s": float("nan")}),
+                      ("future_tol_s", {"future_tol_s": float("nan")}),
+                      ("received_at", {"received_at": float("nan")})):
+        ok, _ = accepted(data=book(now - 1.0), **kw)
+        check(f"a non-finite {label} cannot bypass validation", not ok)
+
+    for label, data in (
+            ("crossed", {"asset_id": "1", "timestamp": str(int(now * 1000)),
+                         "bids": [{"price": "0.60", "size": "1"}],
+                         "asks": [{"price": "0.50", "size": "1"}]}),
+            ("empty", {"asset_id": "1", "timestamp": str(int(now * 1000)),
+                       "bids": [], "asks": []}),
+            ("mismatched asset", book(now, asset="999")),
+            ("zero timestamp", {"asset_id": "1", "timestamp": "0",
+                                "bids": [{"price": "0.5", "size": "1"}],
+                                "asks": []}),
+            ("unreadable timestamp", {"asset_id": "1", "timestamp": "abc",
+                                      "bids": [{"price": "0.5", "size": "1"}],
+                                      "asks": []})):
+        ok, _ = accepted(data=data)
+        check(f"a {label} book is still refused", not ok)
+
+    # The rejection has to carry enough to diagnose it without a rerun.
+    accepted(data=book(now - 33.0))
+    r = orderbook.LAST_TIMESTAMP_REPORT
+    for field in ("exchange_ts_raw", "exchange_ts_s", "unit", "local_ts_s",
+                  "clock_offset_s", "received_at_s", "quiet_s", "held_s",
+                  "max_age_s", "max_quiet_s", "future_tol_s", "source"):
+        check(f"the diagnostic report carries {field}", field in r, str(sorted(r)))
+
+
+def t_ws_book_accepts_a_quiet_resubscribe_snapshot():
+    """The same fault on the websocket path blocked the initial sync.
+
+    A resubscribe snapshot carries the last-change timestamp. Bounding it by
+    stale_after meant any book quiet for more than a few seconds never synced
+    at all, so the token stayed unusable for the whole round.
+    """
+    import timer
+    from feeds.book import BookState
+
+    b = BookState(stale_after=8.0)
+    now_ms = int(timer.wall() * 1000)
+
+    check("a snapshot quiet for 60s passes the event-time gate",
+          b._fresh_exchange_ts(now_ms - 60_000))
+    check("a snapshot quiet for 10 min passes the event-time gate",
+          b._fresh_exchange_ts(now_ms - 600_000))
+    check("a snapshot older than the frozen-venue bound is refused",
+          not b._fresh_exchange_ts(now_ms - 1_200_000))
+    check("a future-dated event is refused",
+          not b._fresh_exchange_ts(now_ms + 30_000))
+    check("a missing timestamp is refused", not b._fresh_exchange_ts(None))
+    check("an unreadable timestamp is refused", not b._fresh_exchange_ts("abc"))
+    check("liveness is still measured from receipt, not event time",
+          b.stale_after == 8.0)
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):

@@ -71,7 +71,20 @@ TRADE_INTERVAL_SECONDS = _env_float("TRADE_INTERVAL_SECONDS", "6")
 MAX_BUY_PRICE = _env_float("MAX_BUY_PRICE", "0.90")
 MIN_BUY_PRICE = _env_float("MIN_BUY_PRICE", "0.20")
 BTC_STALE_AFTER = _env_float("BTC_STALE_AFTER", "3.0")
+# How long the book we hold may have been in our hands. For a REST read
+# this is the request round trip, so it stays near zero.
 ORDERBOOK_MAX_AGE_SECONDS = _env_float("ORDERBOOK_MAX_AGE_SECONDS", "8.0")
+# How long the venue may have left the book UNCHANGED before we stop
+# believing it. This is not freshness: a quiet market legitimately goes
+# minutes without a single change, and measuring staleness from the last
+# change refused perfectly current books. Measured on btc-updown-5m, gaps
+# of 33s between changes are ordinary. The bound exists only to catch a
+# venue serving a frozen or cached book.
+ORDERBOOK_MAX_QUIET_SECONDS = _env_float("ORDERBOOK_MAX_QUIET_SECONDS", "900.0")
+# A book timestamp ahead of our clock by more than this means the clock
+# or the timestamp unit is wrong, never a real book.
+ORDERBOOK_FUTURE_TOLERANCE_SECONDS = _env_float(
+    "ORDERBOOK_FUTURE_TOLERANCE_SECONDS", "5.0")
 MAX_ALLOWED_SPREAD = _env_float("MAX_ALLOWED_SPREAD", "0.25")
 CLOCK_MAX_DRIFT_SECONDS = _env_float("CLOCK_MAX_DRIFT_SECONDS", "2.0")
 PAPER_LATENCY_MS = _env_float("PAPER_LATENCY_MS", "150")
@@ -419,6 +432,14 @@ if PHASE1_ENABLED and BET_SIZE < 5 * PHASE1_MIN_PRICE - 1e-9:
         f"{5 * PHASE1_MIN_PRICE:.2f}")
 _finite_positive("BTC_STALE_AFTER", BTC_STALE_AFTER)
 _finite_positive("ORDERBOOK_MAX_AGE_SECONDS", ORDERBOOK_MAX_AGE_SECONDS)
+_finite_positive("ORDERBOOK_MAX_QUIET_SECONDS", ORDERBOOK_MAX_QUIET_SECONDS)
+_finite_positive("ORDERBOOK_FUTURE_TOLERANCE_SECONDS",
+                 ORDERBOOK_FUTURE_TOLERANCE_SECONDS)
+if ORDERBOOK_FUTURE_TOLERANCE_SECONDS < CLOCK_MAX_DRIFT_SECONDS:
+    raise ValueError(
+        "ORDERBOOK_FUTURE_TOLERANCE_SECONDS must be >= "
+        "CLOCK_MAX_DRIFT_SECONDS, or a clock inside its allowed drift "
+        "would still refuse every book as future-dated")
 if not math.isfinite(MAX_ALLOWED_SPREAD) or not 0 < MAX_ALLOWED_SPREAD <= 1:
     raise ValueError("MAX_ALLOWED_SPREAD must be in (0, 1]")
 _finite_positive("CLOCK_MAX_DRIFT_SECONDS", CLOCK_MAX_DRIFT_SECONDS)
