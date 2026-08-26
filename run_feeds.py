@@ -196,6 +196,12 @@ def derive_creds() -> dict:
         on_event("user_ws", f"no CLOB client: {type(exc).__name__}", "warn")
         return {}
 
+    # `_get_client` already derived and installed creds. Re-calling
+    # create_or_derive here doubled the timeout-sensitive round trips.
+    for attr in ("creds", "api_creds", "_api_creds"):
+        out = creds_from(getattr(client, attr, None))
+        if out:
+            return out
     for attempt in ("create_or_derive_api_key", "create_or_derive_api_creds",
                     "derive_api_key"):
         fn = getattr(client, attempt, None)
@@ -241,7 +247,9 @@ def build_hub(*, paper: bool = False, read_only: bool = False):
     credentials = {} if (paper or read_only) else derive_creds()
     if not (paper or read_only) and cfg.user_ws == "on" and not credentials:
         raise RuntimeError(
-            "live USER_WS is enabled but L2 credentials could not be derived")
+            "live USER_WS is enabled but L2 credentials could not be derived "
+            "(CLOB create/derive timed out or failed). Check connectivity to "
+            "CLOB_HOST and retry.")
     hub = FeedHub(creds=credentials, on_event=on_event,
                   btc_stale_after=cfg.btc_stale_after,
                   book_stale_after=cfg.book_stale_after,
@@ -584,6 +592,16 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
               "PRICE_STALE_POLICY affects only the legacy display value.")
     on_event("config", cfg.describe(), "info" if cfg.decisions_unchanged else "warn")
 
+    # Paint the terminal as soon as the alt-screen can come up. Clock sync and
+    # fill recovery still finish before the bot places anything; they used to
+    # also block the first dashboard frame for the whole HTTP round-trip.
+    dash_task = None
+    if dash:
+        dash_task = asyncio.create_task(
+            _dashboard(hub, cfg, agreement, reconciler, stop,
+                       ledger=ledger, settler=settler, broker=broker))
+        dash_task.add_done_callback(lambda task: _task_failure_event(task, "dashboard"))
+
     # Measure CLOB time before any feed timestamps are judged, so a local
     # clock that is a few seconds behind does not drop live Binance prints.
     import timer
@@ -620,12 +638,7 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     bot_task = asyncio.create_task(main_bot.run_bot(), name="bot")
     tasks.append(bot_task)
 
-    dash_task = None
-    if dash:
-        dash_task = asyncio.create_task(
-            _dashboard(hub, cfg, agreement, reconciler, stop,
-                       ledger=ledger, settler=settler, broker=broker))
-        dash_task.add_done_callback(lambda task: _task_failure_event(task, "dashboard"))
+    if dash_task is not None:
         tasks.append(dash_task)
     else:
         tasks.append(asyncio.create_task(
@@ -993,7 +1006,11 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
             })
             if getattr(renderer, "interactive", False):
                 try:
+                    renderer.cols, renderer.rows = renderer.size()
                     renderer.draw(build(snap, renderer.cols, renderer.rows, g))
+                    with state.lock():
+                        state.render_ms.append(renderer.last_ms)
+                        state.frames += 1
                 except Exception as exc:
                     # A layout bug must not take the trading loop with it, and
                     # it must not stop at a frozen screen either: this task is

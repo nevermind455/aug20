@@ -318,6 +318,8 @@ def bug6_live_pre_submit_guard():
         replace(live, "_journal_fault", None)
         replace(live, "_ambiguous_condition", None)
         replace(live, "_ambiguous_until", 0.0)
+        replace(live, "_ambiguous_tokens", set())
+        replace(live, "_ambiguous_all_tokens", False)
         replace(live, "_order_observer", lambda _receipt: True)
         replace(live, "_validate_round_end", lambda end: float(end))
         replace(live, "_validate_market_mapping", lambda *_a, **_k: {
@@ -397,10 +399,69 @@ def bug6_live_pre_submit_guard():
             setattr(obj, name, value)
 
 
+def bug7_l2_creds_retry_timeout():
+    """A single CLOB read timeout must not abort live L2 derivation."""
+    print("\nBUG 7 - L2 credential derivation died on the first CLOB timeout")
+    import polymarket_trade as live
+
+    class TimeoutOnce:
+        def __init__(self):
+            self.calls = 0
+            self.creds = None
+
+        def create_or_derive_api_key(self):
+            self.calls += 1
+            if self.calls < 3:
+                raise TimeoutError("The read operation timed out")
+            return {"api_key": "k", "api_secret": "s", "api_passphrase": "p"}
+
+        def set_api_creds(self, creds):
+            self.creds = creds
+
+    saved = []
+
+    def replace(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    try:
+        replace(live, "_CREDENTIAL_DERIVE_BACKOFF_SECONDS", (0.0, 0.0))
+        client = TimeoutOnce()
+        live._install_api_creds(client)
+        check("timeouts are retried until derive succeeds",
+              client.calls == 3 and client.creds is not None,
+              f"calls={client.calls} creds={client.creds}")
+
+        class AuthReject:
+            def __init__(self):
+                self.calls = 0
+
+            def create_or_derive_api_key(self):
+                self.calls += 1
+                err = RuntimeError("unauthorized")
+                err.status_code = 401
+                raise err
+
+            def set_api_creds(self, _creds):
+                raise AssertionError("must not install rejected creds")
+
+        rejected = AuthReject()
+        try:
+            live._install_api_creds(rejected)
+            check("non-transient auth failure is not retried", False)
+        except RuntimeError as exc:
+            check("non-transient auth failure is not retried",
+                  rejected.calls == 1 and "unauthorized" in str(exc),
+                  f"calls={rejected.calls} err={exc}")
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+
+
 def main():
     for fn in (bug1_resolver, bug2_clustered_se, bug3_exposure_ceiling,
                bug4_binance_strike, bug5_vote_label,
-               bug6_live_pre_submit_guard):
+               bug6_live_pre_submit_guard, bug7_l2_creds_retry_timeout):
         try:
             fn()
         except Exception as exc:                       # per-test isolation

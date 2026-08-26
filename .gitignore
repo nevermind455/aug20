@@ -63,3 +63,8 @@ wallet_positions.json
 
 # Live diagnostics - may name venue fields; keep local.
 live_diagnostics.log
+
+# Runtime decision journals and pulled wallet history: your own trade
+# record, and not something a public repo should carry.
+*_decisions.csv
+live_activity.json

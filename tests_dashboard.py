@@ -71,7 +71,7 @@ from dashboard import TerminalState, build, snapshot  # noqa: E402
 from dashboard.renderer import (ALT_OFF, ALT_ON, CLEAR, CURSOR_ON,  # noqa: E402
                                 PlainRenderer, Renderer, render_row)
 from dashboard.theme import UNICODE, Style  # noqa: E402
-from dashboard.widgets import big_digits, hsplit, pad, table  # noqa: E402
+from dashboard.widgets import big_digits, blank, hsplit, join, pad, table  # noqa: E402
 
 SIZES = [(c, r) for c in (40, 56, 64, 72, 80, 84, 90, 100, 110, 120, 140, 160, 200, 240)
          for r in (10, 12, 14, 16, 18, 20, 24, 28, 30, 34, 40, 48, 60)]
@@ -354,12 +354,15 @@ def test_frame_diff() -> None:
     r.cols, r.rows = 120, 40
     r.size = lambda: (120, 40)
     r.start()
+    check("start clears the alt screen once", out.getvalue().count(CLEAR) == 1,
+          str(out.getvalue().count(CLEAR)))
     out.truncate(0); out.seek(0)
 
     frame = build(snap, 120, 40, r.g)
     r.draw(frame)
     first = out.getvalue()
-    check("first frame clears once", first.count(CLEAR) == 1, str(first.count(CLEAR)))
+    check("first paint does not flash-clear", CLEAR not in first)
+    check("first paint writes the home row", "\x1b[1;1H" in first)
 
     out.truncate(0); out.seek(0)
     r.draw(frame)
@@ -379,13 +382,40 @@ def test_frame_diff() -> None:
     out.truncate(0); out.seek(0)
     r._resized = True
     r.draw(frame)
-    check("resize forces repaint", CLEAR in out.getvalue())
+    resized = out.getvalue()
+    check("resize does not flash-clear", CLEAR not in resized)
+    check("resize rewrites in place", "\x1b[1;1H" in resized)
 
     out.truncate(0); out.seek(0)
     r.stop()
     tail = out.getvalue()
     check("cursor restored", CURSOR_ON in tail)
     check("alt screen exited", ALT_OFF in tail)
+
+
+def test_join_keeps_requested_height() -> None:
+    short = [blank(10) for _ in range(3)]
+    tall = [blank(10) for _ in range(8)]
+    out = join([tall, short], [10, 10], 8)
+    check("join keeps requested rows when a column is short",
+          len(out) == 8, str(len(out)))
+
+
+def test_size_hysteresis_ignores_one_frame_jitter() -> None:
+    import dashboard.renderer as rend
+    r = Renderer(FakeTTY())
+    r.cols, r.rows = 120, 40
+    r._size_pending = None
+    orig = rend.shutil.get_terminal_size
+    rend.shutil.get_terminal_size = lambda fallback=(120, 40): os.terminal_size((121, 41))
+    try:
+        first = r.size()
+        check("one-frame size jitter is ignored", first == (120, 40), str(first))
+        second = r.size()
+        check("a size that holds for two frames is adopted",
+              second == (121, 41), str(second))
+    finally:
+        rend.shutil.get_terminal_size = orig
 
 
 def test_context_manager_restores_on_exception() -> None:
@@ -704,7 +734,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config is not explicitly BTC / 5m / enabled 60-second TWAP.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
     "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
-    "polymarket_trade.py": "94346efb01c64e26dd9020ea513eb20691059e701271cd1b661e0a79d4c68ecb",
+    # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
+    # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
+    # still waits for a CONFIRMED user-channel trade; omitted amounts are not
+    # invented. An unclear POST now blocks only that outcome, so MULTI can
+    # still place the other side in the same cycle. A ledger balance poll no
+    # longer queues on the order lock or steal the gap between those legs.
+    # Re-approved 2026-08-26: L2 create/derive retries CLOB read timeouts and
+    # uses a 20s SDK HTTP timeout so a single slow auth round trip cannot
+    # abort live USER_WS startup.
+    "polymarket_trade.py": "e565627b336aaeb0ae9ae0b24bed2d2148ba83310ea27b8834b7938d6b33a007",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
     "timer.py": "55cdaf1655b210c83791730b094e79d5c0b00a7e79b6a6ca2bd2950df21e3124",
@@ -816,6 +855,9 @@ def test_order_response_requires_acceptance_evidence() -> None:
         "min_expiry": trade.config.MIN_SECONDS_TO_EXPIRY,
         "ambiguous_condition": trade._ambiguous_condition,
         "ambiguous_until": trade._ambiguous_until,
+        "ambiguous_tokens": set(trade._ambiguous_tokens),
+        "ambiguous_all_tokens": trade._ambiguous_all_tokens,
+        "assumed_delay": trade.config.ASSUMED_MATCH_DELAY_SECONDS,
     }
     up, down = "101", "202"
     condition = "0x" + "a" * 64
@@ -868,10 +910,12 @@ def test_order_response_requires_acceptance_evidence() -> None:
             {"success": True, "orderID": "accepted", "status": "matched",
              "tradeIDs": ["trade-0"]})
         trade._ambiguous_condition = None
+        trade.config.ASSUMED_MATCH_DELAY_SECONDS = 0
         check("an undisclosed matching delay is refused before signing",
               trade.place_trade("UP", 2.0, up, down, condition, window_end) is False
               and "matching delay" in (trade.last_order_error or ""),
               str(trade.last_order_error))
+        trade.config.ASSUMED_MATCH_DELAY_SECONDS = originals["assumed_delay"]
 
         for response in (
             None,
@@ -885,13 +929,16 @@ def test_order_response_requires_acceptance_evidence() -> None:
         ):
             trade._ambiguous_condition = None
             trade._ambiguous_until = 0
+            trade._ambiguous_tokens.clear()
+            trade._ambiguous_all_tokens = False
             trade._client = FakeClient(response)
             check(f"malformed/rejected response {response!r} is not success",
                   trade.place_trade("UP", 2.0, up, down, condition, window_end) is False,
                   str(trade.last_order_error))
 
-        # A matched order must report what it actually executed, in base
-        # units, or the receipt would be recording a guess.
+        # When the venue reports execution amounts they are stored as-is.
+        # When it omits them, the receipt records None rather than a guess;
+        # fill size still comes from a later CONFIRMED user-channel trade.
         amounts = {"makingAmount": "2000000", "takingAmount": "4000000"}
         trade._client = FakeClient(
             {"success": True, "orderID": "accepted", "status": "matched",
@@ -910,10 +957,19 @@ def test_order_response_requires_acceptance_evidence() -> None:
             {"success": True, "orderID": "no-amounts", "status": "matched",
              "tradeIDs": ["trade-x"]})
         trade._ambiguous_condition = None
-        check("a matched response without execution amounts is not accepted",
-              trade.place_trade("UP", 2.0, up, down, condition, window_end) is False
-              and "execution amounts" in (trade.last_order_error or ""),
+        trade._ambiguous_until = 0
+        check("a matched FOK without execution amounts is still placed",
+              trade.place_trade("UP", 2.0, up, down, condition, window_end) is True,
               str(trade.last_order_error))
+        check("omitted execution amounts are not invented on the receipt",
+              trade.last_order_receipt["making_amount_base_units"] is None
+              and trade.last_order_receipt["taking_amount_base_units"] is None
+              and trade.last_order_receipt["order_id"] == "no-amounts"
+              and trade.last_order_receipt["trade_ids"] == ["trade-x"],
+              str(trade.last_order_receipt))
+        check("a known matched FOK does not block the rest of the round",
+              trade._ambiguous_condition is None,
+              str(trade._ambiguous_condition))
 
         class RetryClient:
             def __init__(self):
@@ -967,13 +1023,78 @@ def test_order_response_requires_acceptance_evidence() -> None:
         timeout = TimeoutClient()
         trade._client = timeout
         trade._ambiguous_condition = None
+        trade._ambiguous_tokens.clear()
+        trade._ambiguous_all_tokens = False
         check("ambiguous transport failure is not blindly retried",
               trade.place_trade("UP", 2.0, up, down, condition, window_end) is False and
               timeout.created == timeout.posted == 1,
               repr((timeout.created, timeout.posted)))
 
+        trade._client = FakeClient(
+            {"success": True, "orderID": "other-side", "status": "matched",
+             "tradeIDs": ["trade-other"], **amounts})
+        check("the complementary outcome is still placeable after an ambiguous first leg",
+              trade.place_trade("DOWN", 2.0, up, down, condition, window_end) is True,
+              str(trade.last_order_error))
+        trade._client = FakeClient(
+            {"success": True, "orderID": "same-side", "status": "matched",
+             "tradeIDs": ["trade-same"], **amounts})
+        check("the ambiguous outcome stays blocked to prevent a duplicate",
+              trade.place_trade("UP", 2.0, up, down, condition, window_end) is False
+              and "ambiguous" in (trade.last_order_error or ""),
+              str(trade.last_order_error))
+
+        import threading
+        import time as wall_time
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            trade._execution_lock.acquire()
+            held.set()
+            release.wait(5)
+            trade._execution_lock.release()
+
+        locker = threading.Thread(target=hold_lock)
+        waiter = None
+        results = []
+        locker.start()
+        try:
+            check("lock holder started", held.wait(2))
+            trade.last_order_error = "keep-me"
+            started = wall_time.time()
+            skipped = trade.get_balance_allowance()
+            elapsed = wall_time.time() - started
+            check("a balance poll does not queue behind an in-flight order",
+                  skipped is None and elapsed < 1.0
+                  and trade.last_order_error == "keep-me",
+                  f"elapsed={elapsed:.3f} result={skipped} err={trade.last_order_error}")
+
+            def submit_other_side():
+                results.append(trade.place_trade(
+                    "DOWN", 2.0, up, down, condition, window_end))
+
+            trade._client = FakeClient(
+                {"success": True, "orderID": "after-wait", "status": "matched",
+                 "tradeIDs": ["trade-wait"], **amounts})
+            trade._ambiguous_condition = None
+            trade._ambiguous_tokens.clear()
+            trade._ambiguous_all_tokens = False
+            waiter = threading.Thread(target=submit_other_side)
+            waiter.start()
+            threading.Event().wait(0.2)
+        finally:
+            release.set()
+            if waiter is not None:
+                waiter.join(5)
+            locker.join(2)
+        check("the complementary FOK waits out a non-order API holder",
+              results == [True], str(results))
+
         trade._journal_fault = None
         trade._ambiguous_condition = None
+        trade._ambiguous_tokens.clear()
+        trade._ambiguous_all_tokens = False
         trade.set_order_observer(lambda _receipt: False)
         trade._client = FakeClient(
             {"success": True, "orderID": "unjournaled", "status": "matched",
@@ -1002,6 +1123,10 @@ def test_order_response_requires_acceptance_evidence() -> None:
         trade.config.MIN_SECONDS_TO_EXPIRY = originals["min_expiry"]
         trade._ambiguous_condition = originals["ambiguous_condition"]
         trade._ambiguous_until = originals["ambiguous_until"]
+        trade._ambiguous_tokens.clear()
+        trade._ambiguous_tokens.update(originals["ambiguous_tokens"])
+        trade._ambiguous_all_tokens = originals["ambiguous_all_tokens"]
+        trade.config.ASSUMED_MATCH_DELAY_SECONDS = originals["assumed_delay"]
 
 
 def test_collateral_balance_uses_pusd_units() -> None:

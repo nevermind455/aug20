@@ -1532,7 +1532,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
     "orderbook.py": "98ad9877e1032504010ba2b61e1237e70e76e377400c098bde75aa9a556031dc",
-    "polymarket_trade.py": "94346efb01c64e26dd9020ea513eb20691059e701271cd1b661e0a79d4c68ecb",
+    # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
+    # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
+    # still waits for a CONFIRMED user-channel trade; omitted amounts are not
+    # invented. An unclear POST now blocks only that outcome, so MULTI can
+    # still place the other side in the same cycle. A ledger balance poll no
+    # longer queues on the order lock or steal the gap between those legs.
+    # Re-approved 2026-08-26: L2 create/derive retries CLOB read timeouts and
+    # uses a 20s SDK HTTP timeout so a single slow auth round trip cannot
+    # abort live USER_WS startup.
+    "polymarket_trade.py": "e565627b336aaeb0ae9ae0b24bed2d2148ba83310ea27b8834b7938d6b33a007",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
     "timer.py": "55cdaf1655b210c83791730b094e79d5c0b00a7e79b6a6ca2bd2950df21e3124",

@@ -32,6 +32,8 @@ _market_fee_by_token: dict[str, tuple[float, int]] = {}
 _MAX_FEE_CACHE_TOKENS = 4096
 _ambiguous_condition = None
 _ambiguous_until = 0.0
+_ambiguous_tokens: set[str] = set()
+_ambiguous_all_tokens = False
 last_order_error = None
 last_order_status = None
 last_order_receipt = None
@@ -43,6 +45,11 @@ _DIAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 HEX_SECRET_RE = re.compile(r"0x[0-9a-fA-F]{64}")
 FEE_PRECISION = Decimal("0.00001")
+_API_LOCK_WAIT_SECONDS = 10.0
+_CLOB_HTTP_TIMEOUT_SECONDS = 20.0
+_CREDENTIAL_DERIVE_ATTEMPTS = 3
+_CREDENTIAL_DERIVE_BACKOFF_SECONDS = (1.0, 2.0)
+_clob_http_timeout_applied = False
 
 
 def _safe_error(exc) -> str:
@@ -129,6 +136,71 @@ def _normalize_private_key(raw: str | None) -> str | None:
     return key
 
 
+def _apply_clob_http_timeout() -> None:
+    """The SDK's shared httpx client defaults to a 5s read timeout.
+
+    L2 create/derive is two authenticated round trips. A single slow CLOB
+    read used to abort live startup as "credentials could not be derived".
+    """
+    global _clob_http_timeout_applied
+    if _clob_http_timeout_applied:
+        return
+    try:
+        import httpx
+        import py_clob_client_v2.http_helpers.helpers as helpers
+    except ImportError:
+        return
+    previous = getattr(helpers, "_http_client", None)
+    helpers._http_client = httpx.Client(
+        http2=True, timeout=httpx.Timeout(_CLOB_HTTP_TIMEOUT_SECONDS))
+    if previous is not None:
+        try:
+            previous.close()
+        except Exception:
+            pass
+    _clob_http_timeout_applied = True
+
+
+def _is_transient_clob_error(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status < 500:
+        return False
+    text = str(exc or "").lower()
+    name = type(exc).__name__.lower()
+    return (
+        "timeout" in text or "timed out" in text or "timeout" in name
+        or "connect" in name or "connection" in text or "network" in text
+        or "request exception" in text
+    )
+
+
+def _install_api_creds(client) -> None:
+    last_error = None
+    for attempt in range(_CREDENTIAL_DERIVE_ATTEMPTS):
+        try:
+            creds = client.create_or_derive_api_key()
+            if creds is None:
+                raise RuntimeError("credential derivation returned no credentials")
+            client.set_api_creds(creds)
+            return
+        except Exception as exc:
+            last_error = exc
+            if (attempt + 1 >= _CREDENTIAL_DERIVE_ATTEMPTS
+                    or not _is_transient_clob_error(exc)):
+                break
+            delay = _CREDENTIAL_DERIVE_BACKOFF_SECONDS[
+                min(attempt, len(_CREDENTIAL_DERIVE_BACKOFF_SECONDS) - 1)]
+            print(
+                f"[LIVE] L2 credential derivation failed "
+                f"({type(exc).__name__}: {_safe_error(exc)}); "
+                f"retry {attempt + 2}/{_CREDENTIAL_DERIVE_ATTEMPTS} in {delay:.0f}s"
+            )
+            time.sleep(delay)
+    raise RuntimeError(
+        f"could not derive L2 API credentials: {_safe_error(last_error)}"
+    ) from None
+
+
 def _get_client() -> ClobClient:
     global _client
     if _live_disabled:
@@ -155,14 +227,9 @@ def _get_client() -> ClobClient:
         client_kwargs["signature_type"] = config.POLY_SIGNATURE_TYPE
     if funder:
         client_kwargs["funder"] = funder
+    _apply_clob_http_timeout()
     client = ClobClient(**client_kwargs)
-    try:
-        creds = client.create_or_derive_api_key()
-        if creds is None:
-            raise RuntimeError("credential derivation returned no credentials")
-        client.set_api_creds(creds)
-    except Exception as exc:
-        raise RuntimeError(f"could not derive L2 API credentials: {_safe_error(exc)}") from None
+    _install_api_creds(client)
 
     _client = client
     print("[LIVE] CLOB V2 client initialized (wallet identifiers redacted).")
@@ -196,8 +263,9 @@ def _read_balance(client) -> dict | None:
 
 def get_balance_allowance() -> dict | None:
     global last_order_error
-    if not _execution_lock.acquire(timeout=10.0):
-        last_order_error = "balance read timed out behind another live API action"
+    # Non-blocking: a queued wait here used to acquire in the gap between
+    # MULTI legs and make the second FOK fail as "already in flight".
+    if not _execution_lock.acquire(blocking=False):
         return None
     try:
         result = _read_balance(_get_client())
@@ -292,8 +360,10 @@ def _accepted_order_response(resp) -> tuple[str | None, str | None, str | None]:
             or len(set(map(str, trades))) != len(trades)
             or len(set(map(str, transactions))) != len(transactions)):
         return None, status, "matched FOK response has invalid trade evidence"
-    if not _valid_execution_amounts(resp):
-        return None, status, "matched FOK response omitted valid execution amounts"
+    # Current CLOB FOK matched replies often omit makingAmount/takingAmount
+    # even when they include orderID + tradeIDs. Those amounts are fill size,
+    # not placement evidence; inventing them would be a guess, and treating
+    # the POST as unknown would retry or block a round that already matched.
     return str(oid), status, None
 
 
@@ -314,8 +384,7 @@ def _accepted_pending_response(resp) -> tuple[str | None, str | None, str | None
         return None, None, None
     oid = resp.get("orderID") or resp.get("order_id")
     status = str(resp.get("status") or "").strip()
-    if (not _valid_response_id(oid) or not _valid_execution_amounts(resp)
-            or status.lower() in _FAILED_ORDER_STATUSES):
+    if not _valid_response_id(oid) or status.lower() in _FAILED_ORDER_STATUSES:
         return None, status or None, None
     return str(oid), status or None, (
         "DELAYED_PENDING_OUTCOME" if status.lower() == "delayed" else
@@ -354,6 +423,10 @@ def _valid_execution_amounts(resp: dict) -> bool:
 def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
                    token_id, window_end, amount, estimated_fee,
                    fee_rate, fee_exponent, validation: str) -> dict:
+    making = taking = None
+    if _valid_execution_amounts(resp):
+        making = str(resp["makingAmount"])
+        taking = str(resp["takingAmount"])
     return {
         "order_id": oid,
         "status": status,
@@ -361,8 +434,8 @@ def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
         "trade_ids": list(resp.get("tradeIDs") or resp.get("trade_ids") or []),
         "transaction_hashes": list(
             resp.get("transactionsHashes") or resp.get("transaction_hashes") or []),
-        "making_amount_base_units": str(resp.get("makingAmount")),
-        "taking_amount_base_units": str(resp.get("takingAmount")),
+        "making_amount_base_units": making,
+        "taking_amount_base_units": taking,
         "condition_id": str(condition_id),
         "token_id": token_id,
         "window_end": window_end,
@@ -535,10 +608,37 @@ def _validate_round_end(window_end) -> float:
     return end
 
 
-def _mark_ambiguous(condition_id: str, window_end: float) -> None:
-    global _ambiguous_condition, _ambiguous_until
-    _ambiguous_condition = str(condition_id)
-    _ambiguous_until = float(window_end)
+def _mark_ambiguous(condition_id: str, window_end: float,
+                    token_id: str | None = None) -> None:
+    """Block resubmission of an unknown POST, scoped to the token when known.
+
+    MULTI places both outcomes in one cycle. A condition-wide lock after the
+    first leg's unclear reply is what skipped the other side even when the
+    first FOK had already matched.
+    """
+    global _ambiguous_condition, _ambiguous_until, _ambiguous_all_tokens
+    cid = str(condition_id)
+    end = float(window_end)
+    if _ambiguous_condition != cid or time.time() >= _ambiguous_until:
+        _ambiguous_tokens.clear()
+        _ambiguous_all_tokens = False
+    _ambiguous_condition = cid
+    _ambiguous_until = end
+    if token_id:
+        _ambiguous_tokens.add(str(token_id))
+    else:
+        _ambiguous_all_tokens = True
+        _ambiguous_tokens.clear()
+
+
+def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
+    if _ambiguous_condition != str(condition_id):
+        return False
+    if time.time() >= _ambiguous_until:
+        return False
+    if _ambiguous_all_tokens:
+        return True
+    return str(token_id) in _ambiguous_tokens
 
 
 def _journal_receipt(receipt: dict) -> bool:
@@ -586,8 +686,10 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
     before each signing/POST boundary.  It may reject, but never changes side.
     """
     global last_order_error
-    if not _execution_lock.acquire(blocking=False):
-        last_order_error = "another live order is already in flight"
+    # Wait out a short in-flight balance/cancel HTTP. Failing immediately made
+    # MULTI drop the complementary FOK when a ledger poll held this lock.
+    if not _execution_lock.acquire(timeout=_API_LOCK_WAIT_SECONDS):
+        last_order_error = "timed out waiting for the live API"
         return False
     try:
         return _place_trade(side, amount, up_token_id, down_token_id,
@@ -641,10 +743,10 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
 
     try:
         end = _validate_round_end(window_end)
-        if (_ambiguous_condition == str(condition_id)
-                and time.time() < _ambiguous_until):
+        if _ambiguous_blocks(condition_id, token_id):
             raise RuntimeError(
-                "prior submission has an ambiguous result; this round is blocked to prevent duplicates")
+                "prior submission of this outcome has an ambiguous result; "
+                "it is blocked to prevent duplicates")
         client = _get_client()
         rules = _validate_market_mapping(
             client.get_clob_market_info(str(condition_id)), condition_id,
@@ -748,8 +850,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 time.sleep(0.5)
                 continue
             if not _is_no_match(err):
-                _mark_ambiguous(condition_id, end)
-                err = f"ambiguous submission; round blocked: {err}"
+                _mark_ambiguous(condition_id, end, token_id)
+                err = f"ambiguous submission; outcome blocked: {err}"
             last_order_error = err
             print(f"[LIVE] Place order error: {last_order_error}")
             return False
@@ -787,10 +889,11 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                     return True
                 # A documented delayed placement has a known order ID and is
                 # followed through the user channel. Any other incomplete
-                # success blocks another submission for this condition because
-                # its terminal outcome is not yet known.
+                # success blocks another submission of this token because its
+                # terminal outcome is not yet known. The other outcome of the
+                # same market stays placeable so MULTI can still complete a pair.
                 if pending_kind != "DELAYED_PENDING_OUTCOME":
-                    _mark_ambiguous(condition_id, end)
+                    _mark_ambiguous(condition_id, end, token_id)
                 last_order_error = None
                 print(
                     f"[LIVE] FOK accepted: {side} ${amount:.2f} "
@@ -799,14 +902,16 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 )
                 return True
             # A response received after POST that is not an explicit no-fill
-            # may describe an accepted order incompletely. Block the round.
+            # may describe an accepted order incompletely. Block this token
+            # only: the complementary MULTI leg is a different order.
             if not _is_no_match(err) and not _definitive_rejection(resp):
-                _mark_ambiguous(condition_id, end)
+                _mark_ambiguous(condition_id, end, token_id)
                 # Say WHAT came back, not just that it was unclassifiable.
                 # A venue with a taker matching delay can acknowledge an order
                 # before it has any trade evidence, and the parser requires
                 # tradeIDs or transactionsHashes - so a perfectly ordinary
-                # accepted order reads as ambiguous and blocks the round.
+                # accepted order used to read as ambiguous and skip the other
+                # MULTI leg. That lock is now per-outcome, not per-round.
                 # Field names and status only; no amounts, ids or wallet data.
                 shape = "non-dict"
                 if isinstance(resp, dict):
@@ -836,7 +941,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                         os.fsync(_fh.fileno())
                 except Exception:
                     pass
-                err = f"ambiguous order response; round blocked: {err}"
+                err = f"ambiguous order response; outcome blocked: {err}"
             last_order_error = err
             print(f"[LIVE] Place order error: {last_order_error}")
             return False

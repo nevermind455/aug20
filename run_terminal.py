@@ -160,6 +160,7 @@ async def render_loop(state: TerminalState, stop: threading.Event, keys: Keys,
             if isinstance(renderer, PlainRenderer):
                 renderer.status(snap)
             else:
+                renderer.cols, renderer.rows = renderer.size()
                 frame = build(snap, renderer.cols, renderer.rows, g)
                 renderer.draw(frame)
 

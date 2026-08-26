@@ -1,8 +1,8 @@
 """Terminal renderer.
 
-One write() per frame. Only changed rows are rewritten. The screen is
-cleared exactly twice: on the first frame and after a resize. Nothing here
-touches the bot.
+One write() per frame. Only changed rows are rewritten. The alt screen is
+cleared once at start. Resizes rewrite in place — a full 2J clear between
+frames is what flashed blank and shook the layout. Nothing here touches the bot.
 """
 from __future__ import annotations
 
@@ -20,8 +20,11 @@ ALT_ON = "\x1b[?1049h"
 ALT_OFF = "\x1b[?1049l"
 CURSOR_OFF = "\x1b[?25l"
 CURSOR_ON = "\x1b[?25h"
+WRAP_OFF = "\x1b[?7l"
+WRAP_ON = "\x1b[?7h"
 CLEAR = "\x1b[2J\x1b[H"
 HOME = "\x1b[H"
+ERASE_LINE = "\x1b[K"
 
 
 def render_row(row: Row) -> str:
@@ -47,6 +50,8 @@ class Renderer:
         self.utf8 = enable_utf8_output(self.stream)
         self.g = glyphs()
         self.last_error: str | None = None
+        self._size_pending: tuple[int, int] | None = None
+        self.cols, self.rows = 0, 0
         self.cols, self.rows = self.size()
         self._prev: list[str] = []
         self._force = True
@@ -64,7 +69,19 @@ class Renderer:
         except Exception as exc:
             self.last_error = f"terminal size failed: {exception_summary(exc)}"
             c, r = 120, 40
-        return max(self.min_cols, c), max(self.min_rows, r)
+        c, r = max(self.min_cols, c), max(self.min_rows, r)
+        # Windows reports a ±1 window size while a frame is painting. Adopting
+        # that every frame rebuilds the layout and used to full-clear the alt
+        # screen — the shake and the blank flash.
+        current = (self.cols, self.rows)
+        if self.cols <= 0 or self.rows <= 0 or (c, r) == current:
+            self._size_pending = None
+            return c, r
+        if self._size_pending == (c, r):
+            self._size_pending = None
+            return c, r
+        self._size_pending = (c, r)
+        return current
 
     def _on_winch(self, *_a) -> None:
         self._resized = True
@@ -82,7 +99,7 @@ class Renderer:
             except (ValueError, OSError) as exc:
                 self.last_error = f"resize handler unavailable: {exception_summary(exc)}"
         try:
-            self.stream.write(ALT_ON + CURSOR_OFF + CLEAR)
+            self.stream.write(ALT_ON + CURSOR_OFF + WRAP_OFF + CLEAR)
             self.stream.flush()
         except Exception as exc:
             self.last_error = f"terminal start failed: {exception_summary(exc)}"
@@ -110,7 +127,7 @@ class Renderer:
             self._restore_signal_handler()
             return
         try:
-            self.stream.write(RESET + CURSOR_ON + ALT_OFF)
+            self.stream.write(RESET + WRAP_ON + CURSOR_ON + ALT_OFF)
             self.stream.flush()
         except Exception as exc:
             self.last_error = f"terminal restore failed: {exception_summary(exc)}"
@@ -136,31 +153,35 @@ class Renderer:
             self.last_ms = (time.perf_counter() - t0) * 1000.0
             return self.last_ms
 
-        c, r = self.size()
-        if self._resized or (c, r) != (self.cols, self.rows):
-            self.cols, self.rows = c, r
+        # The frame was built at caller-set cols/rows. A second size() here
+        # can disagree on Windows and used to 2J-flash every frame.
+        if self._resized or (self._prev and len(frame) != len(self._prev)):
             self._resized = False
             self._force = True
 
         lines = [render_row(row) for row in frame]
         buf = []
         if self._force:
-            buf.append(CLEAR)
+            # Never 2J here. A full clear blanks the alt screen for a frame
+            # (the flash). start() already cleared once. On resize, rewrite
+            # every row in place and erase leftovers from a taller previous
+            # frame.
             for i, line in enumerate(lines):
-                buf.append(f"\x1b[{i + 1};1H")
+                buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
                 buf.append(line)
+            for i in range(len(lines), len(self._prev)):
+                buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
             self._force = False
         else:
             for i, line in enumerate(lines):
                 if i >= len(self._prev) or self._prev[i] != line:
-                    buf.append(f"\x1b[{i + 1};1H")
+                    buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
                     buf.append(line)
         wrote = False
         if buf:
             buf.append(f"\x1b[{len(lines)};{1}H")
             try:
-                self.stream.write("".join(buf))
-                self.stream.flush()
+                self._emit(buf)
                 wrote = True
             except Exception as exc:
                 self.last_error = f"terminal write failed: {exception_summary(exc)}"
@@ -172,6 +193,23 @@ class Renderer:
             self._prev = lines
         self.last_ms = (time.perf_counter() - t0) * 1000.0
         return self.last_ms
+
+    def _emit(self, parts: list[str]) -> None:
+        """Write the frame in bounded flushes.
+
+        A single giant write can be truncated on Windows consoles (~64KiB),
+        which left the bottom panels unpainted until a later diff. Chunked
+        writes stay under that limit; one flush at the end avoids painting a
+        half-frame that looks like shake.
+        """
+        payload = "".join(parts)
+        limit = 4096
+        offset = 0
+        total = len(payload)
+        while offset < total:
+            self.stream.write(payload[offset:offset + limit])
+            offset += limit
+        self.stream.flush()
 
 
 class PlainRenderer:
