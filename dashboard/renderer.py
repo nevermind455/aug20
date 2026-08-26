@@ -201,14 +201,27 @@ class Renderer:
         which left the bottom panels unpainted until a later diff. Chunked
         writes stay under that limit; one flush at the end avoids painting a
         half-frame that looks like shake.
+
+        Chunks break between `parts`, never inside one. Slicing the joined
+        payload at a fixed offset cut two of every three chunks in the middle
+        of an SGR sequence ("ESC[0;38;5;25;48" + ";5;230m"); the console
+        dropped the truncated code and painted the rest of that row in the
+        default background - a blank-looking strip that moved with the content
+        and vanished on the next repaint. Every part is either a cursor move
+        or a full row ending in RESET, so a boundary between parts is always
+        colour-neutral.
         """
-        payload = "".join(parts)
         limit = 4096
-        offset = 0
-        total = len(payload)
-        while offset < total:
-            self.stream.write(payload[offset:offset + limit])
-            offset += limit
+        buf: list[str] = []
+        size = 0
+        for part in parts:
+            if buf and size + len(part) > limit:
+                self.stream.write("".join(buf))
+                buf, size = [], 0
+            buf.append(part)
+            size += len(part)
+        if buf:
+            self.stream.write("".join(buf))
         self.stream.flush()
 
 
