@@ -20,6 +20,23 @@ from decimal import Decimal
 
 sys.path.insert(0, ".")
 
+# Run against config.py's built-in defaults, never the operator's .env.
+#
+# Every assertion in this file is written against the defaults. config.py calls
+# load_dotenv(override=False), so the suite cannot neutralise a knob by
+# deleting it - .env simply repopulates it on the next reload - and knobs whose
+# default is computed (MAX_ROUND_EXPOSURE) cannot be pinned to a literal
+# either. Stubbing the loader before config is first imported is the only way
+# to get all 46 keys at once, and it survives importlib.reload() because
+# config re-runs `from dotenv import load_dotenv` each time.
+#
+# Without this the suite graded whatever the operator had most recently tuned
+# instead of the code: a 7-band ladder plus PHASE2_MULTI_SIGNAL=1 turned 22
+# tests red, including one that timed out because no order was ever reached.
+import dotenv  # noqa: E402
+
+dotenv.load_dotenv = lambda *_a, **_kw: False
+
 if importlib.util.find_spec("requests") is None:
     requests_stub = types.ModuleType("requests")
     requests_stub.get = lambda *_a, **_kw: None
