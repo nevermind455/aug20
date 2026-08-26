@@ -181,9 +181,11 @@ def creds_from(obj) -> dict:
 def derive_creds() -> dict:
     """L2 API credentials for the user channel.
 
-    Uses the SAME documented call the bot already uses to authenticate
-    (`create_or_derive_api_key`), rather than guessing at where the client
-    stashes the result. Attribute probing is only a fallback.
+    `_get_client` has already derived and installed these, so read them off
+    the client first; calling `create_or_derive_api_key` again doubles the
+    timeout-sensitive round trips that were failing auth at startup. The
+    documented call remains the fallback for a client that exposes no
+    recognisable attribute.
 
     Never logged, never written to disk, never put in an exception message.
     """
