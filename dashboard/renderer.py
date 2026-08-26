@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import sys
+import threading
 import time
 
 from .safety import exception_summary, terminal_text
@@ -61,6 +62,9 @@ class Renderer:
         self._winch_installed = False
         self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
         self.last_ms = 0.0
+        # One frame reaches the terminal at a time. Two draws interleaving
+        # would emit each other's cursor moves between row paints.
+        self._draw_lock = threading.RLock()
 
     # ------------------------------------------------------------- lifecycle
     def size(self) -> tuple[int, int]:
@@ -152,6 +156,10 @@ class Renderer:
         if not self.interactive:
             self.last_ms = (time.perf_counter() - t0) * 1000.0
             return self.last_ms
+        with self._draw_lock:
+            return self._draw_locked(frame, t0)
+
+    def _draw_locked(self, frame: list[Row], t0: float) -> float:
 
         # The frame was built at caller-set cols/rows. A second size() here
         # can disagree on Windows and used to 2J-flash every frame.
@@ -167,16 +175,17 @@ class Renderer:
             # every row in place and erase leftovers from a taller previous
             # frame.
             for i, line in enumerate(lines):
-                buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
-                buf.append(line)
+                buf.append(f"\x1b[{i + 1};1H" + line)
+            # Rows past the end of this frame have no replacement
+            # content, so these are the only erases left - blanking
+            # them is the intent, not a gap before a repaint.
             for i in range(len(lines), len(self._prev)):
                 buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
             self._force = False
         else:
             for i, line in enumerate(lines):
                 if i >= len(self._prev) or self._prev[i] != line:
-                    buf.append(f"\x1b[{i + 1};1H" + ERASE_LINE)
-                    buf.append(line)
+                    buf.append(f"\x1b[{i + 1};1H" + line)
         wrote = False
         if buf:
             buf.append(f"\x1b[{len(lines)};{1}H")
@@ -195,23 +204,36 @@ class Renderer:
         return self.last_ms
 
     def _emit(self, parts: list[str]) -> None:
-        """Write the frame in bounded flushes.
+        """Put the whole frame on screen in as few writes as possible.
 
-        A single giant write can be truncated on Windows consoles (~64KiB),
-        which left the bottom panels unpainted until a later diff. Chunked
-        writes stay under that limit; one flush at the end avoids painting a
-        half-frame that looks like shake.
+        Each part is a complete row paint - a cursor move followed by content
+        that covers the line edge to edge - so nothing here can leave a row
+        half-drawn.
 
-        Chunks break between `parts`, never inside one. Slicing the joined
-        payload at a fixed offset cut two of every three chunks in the middle
-        of an SGR sequence ("ESC[0;38;5;25;48" + ";5;230m"); the console
-        dropped the truncated code and painted the rest of that row in the
-        default background - a blank-looking strip that moved with the content
-        and vanished on the next repaint. Every part is either a cursor move
-        or a full row ending in RESET, so a boundary between parts is always
-        colour-neutral.
+        The frame goes out as one write. Handing the text layer a chunk at a
+        time let its 8 KiB buffer flush mid-frame, and the console drew
+        whatever had arrived: at 209x51 a normal frame is ~12 KiB over three
+        or four writes, six times a second. Writing the encoded bytes in a
+        single call keeps the whole frame in one console write, so a partial
+        frame is never displayed.
+
+        Windows consoles accept 32767 characters per write, so oversized
+        frames still have to be split. They break between rows, never inside
+        one.
         """
-        limit = 4096
+        payload = "".join(parts)
+        raw = getattr(self.stream, "buffer", None)
+        limit = 32000
+        if raw is not None and len(payload) <= limit:
+            enc = getattr(self.stream, "encoding", None) or "utf-8"
+            self.stream.flush()          # keep start()/stop() ordering intact
+            raw.write(payload.encode(enc, "replace"))
+            raw.flush()
+            return
+        if len(payload) <= limit:
+            self.stream.write(payload)
+            self.stream.flush()
+            return
         buf: list[str] = []
         size = 0
         for part in parts:
